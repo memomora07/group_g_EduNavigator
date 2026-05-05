@@ -1,4 +1,6 @@
 
+# College0 local Tkinter application.
+# Run with: python college0_ccny_gui.py
 
 import sqlite3
 import tkinter as tk
@@ -123,6 +125,19 @@ class College0DB:
             word TEXT PRIMARY KEY
         )
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS system_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rule_events (
+            user_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
+            PRIMARY KEY(user_id, event_key)
+        )
+        """)
         self.conn.commit()
 
     def seed_data(self):
@@ -192,6 +207,10 @@ class College0DB:
         for word in ["stupid", "idiot", "trash"]:
             cur.execute(
                 "INSERT OR IGNORE INTO taboo_words(word) VALUES (?)", (word,))
+        cur.execute(
+            "INSERT OR IGNORE INTO system_state(key, value) VALUES ('current_period', 'Registration')")
+        cur.execute(
+            "INSERT OR IGNORE INTO system_state(key, value) VALUES ('student_quota', '6')")
         self.conn.commit()
 
     def authenticate(self, username, password):
@@ -204,6 +223,102 @@ class College0DB:
         self.conn.execute(
             "UPDATE users SET password=?, must_change_password=0 WHERE id=?", (new_password, user_id))
         self.conn.commit()
+
+    def get_setting(self, key, default=""):
+        cur = self.conn.cursor()
+        cur.execute("SELECT value FROM system_state WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.conn.execute(
+            "INSERT INTO system_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        self.conn.commit()
+
+    def get_current_period(self):
+        return self.get_setting("current_period", "Registration")
+
+    def has_rule_event(self, user_id, event_key):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM rule_events WHERE user_id=? AND event_key=?", (user_id, event_key))
+        return cur.fetchone() is not None
+
+    def add_rule_event(self, user_id, event_key):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO rule_events(user_id, event_key) VALUES (?, ?)", (user_id, event_key))
+
+    def refresh_user_status(self, user_id):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT role, warnings, suspended FROM users WHERE id=?", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+        suspended = row["suspended"]
+        if row["warnings"] >= 3:
+            suspended = 1
+        self.conn.execute(
+            "UPDATE users SET suspended=? WHERE id=?", (suspended, user_id))
+
+    def issue_warning(self, user_id, event_key, count=1):
+        if event_key and self.has_rule_event(user_id, event_key):
+            return False
+        self.conn.execute(
+            "UPDATE users SET warnings = warnings + ? WHERE id=?", (count, user_id))
+        if event_key:
+            self.add_rule_event(user_id, event_key)
+        self.refresh_user_status(user_id)
+        self.conn.commit()
+        return True
+
+    def get_student_quota(self):
+        try:
+            return int(self.get_setting("student_quota", "6"))
+        except ValueError:
+            return 6
+
+    def get_active_student_count(self):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM users WHERE role='Student' AND suspended=0")
+        return cur.fetchone()["cnt"]
+
+    def evaluate_application_rule(self, app):
+        if app["role_applied"] != "Student":
+            return "Approve", "Instructor applications may be approved directly by the registrar."
+        quota = self.get_student_quota()
+        active_students = self.get_active_student_count()
+        if app["gpa"] > 3.0 and active_students < quota:
+            return "Approve", f"Student GPA is above 3.0 and the active student count {active_students}/{quota} is within quota."
+        if app["gpa"] <= 3.0:
+            return "Reject", "Student GPA must be above 3.0 for normal admission."
+        return "Reject", f"Student quota reached: {active_students}/{quota} active students."
+
+    def set_current_period(self, new_period):
+        old_period = self.get_current_period()
+        message_parts = []
+        requested_period = new_period
+        if new_period == "Running":
+            affected = self.run_running_period_audit()
+            if affected:
+                requested_period = "Special Registration"
+                message_parts.append(
+                    "Classes with fewer than 3 students were canceled, so the system moved into Special Registration.")
+        elif old_period == "Grading" and new_period != "Grading":
+            audit_message = self.run_grading_period_audit()
+            if audit_message:
+                message_parts.append(audit_message)
+        self.set_setting("current_period", requested_period)
+        self.conn.execute(
+            "UPDATE classes SET period_state=? WHERE cancelled=0", (requested_period,))
+        self.conn.commit()
+        if not message_parts:
+            message_parts.append(
+                f"Semester period changed from {old_period} to {requested_period}.")
+        return " ".join(message_parts)
 
     def public_rankings(self):
         cur = self.conn.cursor()
@@ -249,12 +364,37 @@ class College0DB:
         cur.execute("SELECT * FROM applications ORDER BY status, id DESC")
         return cur.fetchall()
 
+    def get_class_setup_rows(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+        SELECT cl.id, c.code, c.title, cl.meeting_time, cl.capacity, cl.instructor_id,
+               u.full_name AS instructor
+        FROM classes cl
+        JOIN courses c ON c.id = cl.course_id
+        LEFT JOIN users u ON u.id = cl.instructor_id
+        ORDER BY c.code
+        """)
+        return cur.fetchall()
+
+    def update_class_setup(self, class_id, instructor_id, meeting_time, capacity):
+        if self.get_current_period() != "Setup":
+            return "Class setup is only editable during the Setup period."
+        self.conn.execute(
+            "UPDATE classes SET instructor_id=?, meeting_time=?, capacity=?, period_state='Setup' WHERE id=?",
+            (instructor_id, meeting_time, capacity, class_id),
+        )
+        self.conn.commit()
+        return "Class setup updated."
+
     def approve_application(self, app_id, justification=""):
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM applications WHERE id=?", (app_id,))
         app = cur.fetchone()
         if not app or app["status"] != "Pending":
             return "Application not found or already processed."
+        recommended_action, reason = self.evaluate_application_rule(app)
+        if recommended_action != "Approve" and not justification.strip():
+            return f"Approval requires a justification. Rule check: {reason}"
         cur.execute(
             "UPDATE applications SET status='Approved', justification=? WHERE id=?", (justification, app_id))
         role = app["role_applied"]
@@ -273,12 +413,21 @@ class College0DB:
             cur.execute(
                 "INSERT INTO instructor_profiles(user_id, avg_rating) VALUES (?, 0.0)", (user_id,))
         self.conn.commit()
-        return f"Approved. Username: {username} | Temporary password: {password}"
+        return f"Approved. Username: {username} | Temporary password: {password} | Rule check: {reason}"
 
     def reject_application(self, app_id, justification=""):
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM applications WHERE id=?", (app_id,))
+        app = cur.fetchone()
+        if not app or app["status"] != "Pending":
+            return "Application not found or already processed."
+        recommended_action, reason = self.evaluate_application_rule(app)
+        if app["role_applied"] == "Student" and recommended_action != "Reject" and not justification.strip():
+            return f"Rejecting this student application requires a justification. Rule check: {reason}"
         self.conn.execute(
             "UPDATE applications SET status='Rejected', justification=? WHERE id=?", (justification, app_id))
         self.conn.commit()
+        return f"Rejected. Rule check: {reason}"
 
     def get_available_classes(self):
         cur = self.conn.cursor()
@@ -292,7 +441,9 @@ class College0DB:
         WHERE cl.cancelled = 0
         ORDER BY c.code
         """)
-        return cur.fetchall()
+        rows = list(cur.fetchall())
+        current_period = self.get_current_period()
+        return [dict(row) | {"period_state": current_period} for row in rows]
 
     def get_student_registrations(self, student_id):
         cur = self.conn.cursor()
@@ -308,10 +459,17 @@ class College0DB:
 
     def register_student(self, student_id, class_id):
         cur = self.conn.cursor()
+        current_period = self.get_current_period()
+        if current_period not in {"Registration", "Special Registration"}:
+            return "Registration is only allowed during the Registration or Special Registration period."
         cur.execute(
             "SELECT COUNT(*) AS cnt FROM registrations WHERE student_id=?", (student_id,))
         if cur.fetchone()["cnt"] >= 4:
             return "A student can register for at most 4 courses."
+        cur.execute("SELECT suspended FROM users WHERE id=?", (student_id,))
+        status_row = cur.fetchone()
+        if status_row and status_row["suspended"]:
+            return "Suspended students cannot register for classes."
         cur.execute("""
         SELECT cl.meeting_time
         FROM registrations r
@@ -324,8 +482,6 @@ class College0DB:
         target = cur.fetchone()
         if not target:
             return "Class not found."
-        if target["period_state"] != "Registration":
-            return "Registration is only allowed during the Registration period."
         if target["meeting_time"] in current_times:
             return "Time conflict detected."
         cur.execute(
@@ -361,19 +517,24 @@ class College0DB:
     def get_students_in_class(self, class_id):
         cur = self.conn.cursor()
         cur.execute("""
-        SELECT r.id, u.full_name, u.id AS student_id, r.grade
+        SELECT r.id, u.full_name, u.id AS student_id, u.username, u.warnings,
+               sp.overall_gpa, sp.honor_roll, r.grade
         FROM registrations r
         JOIN users u ON u.id = r.student_id
+        LEFT JOIN student_profiles sp ON sp.user_id = u.id
         WHERE r.class_id = ?
         ORDER BY u.full_name
         """, (class_id,))
         return cur.fetchall()
 
     def assign_grade(self, registration_id, grade):
+        if self.get_current_period() != "Grading":
+            return "Grades can only be assigned during the Grading period."
         self.conn.execute(
             "UPDATE registrations SET grade=? WHERE id=?", (grade, registration_id))
         self.conn.commit()
         self.recalculate_gpa()
+        return "Grade saved."
 
     def get_waitlist(self, class_id):
         cur = self.conn.cursor()
@@ -387,12 +548,19 @@ class College0DB:
         return cur.fetchall()
 
     def admit_waitlisted_student(self, wait_id, class_id):
+        if self.get_current_period() not in {"Registration", "Special Registration"}:
+            return "Wait-list admissions are only available during Registration or Special Registration."
         cur = self.conn.cursor()
         cur.execute(
             "SELECT student_id FROM waitlist WHERE id=? AND class_id=?", (wait_id, class_id))
         row = cur.fetchone()
         if not row:
             return "Wait-list record not found."
+        cur.execute("SELECT suspended FROM users WHERE id=?",
+                    (row["student_id"],))
+        student_status = cur.fetchone()
+        if student_status and student_status["suspended"]:
+            return "Suspended students cannot be admitted from the wait-list."
         cur.execute("SELECT capacity FROM classes WHERE id=?", (class_id,))
         capacity = cur.fetchone()["capacity"]
         cur.execute(
@@ -416,6 +584,14 @@ class College0DB:
         self.conn.commit()
 
     def submit_review(self, class_id, student_id, stars, review_text):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT grade FROM registrations WHERE class_id=? AND student_id=?", (class_id, student_id))
+        reg = cur.fetchone()
+        if not reg:
+            return "Only students enrolled in the class can review it."
+        if reg["grade"]:
+            return "Reviews close after the instructor posts the grade."
         taboo = self.get_taboo_words()
         words = review_text.split()
         hit_count = 0
@@ -429,20 +605,24 @@ class College0DB:
                 visible_words.append(w)
         hidden = 0
         visible_text = " ".join(visible_words)
+        warning_count = 0
+        warning_key = None
         if hit_count >= 3:
             hidden = 1
             visible_text = "[Hidden due to taboo language]"
-            self.conn.execute(
-                "UPDATE users SET warnings = warnings + 2 WHERE id=?", (student_id,))
+            warning_count = 2
+            warning_key = f"review_taboo_3_{class_id}"
         elif hit_count in [1, 2]:
-            self.conn.execute(
-                "UPDATE users SET warnings = warnings + 1 WHERE id=?", (student_id,))
+            warning_count = 1
+            warning_key = f"review_taboo_1_{class_id}"
         try:
             self.conn.execute("""
             INSERT INTO reviews(class_id, student_id, stars, review_text, visible_text, hidden)
             VALUES (?, ?, ?, ?, ?, ?)
             """, (class_id, student_id, stars, review_text, visible_text, hidden))
             self.conn.commit()
+            if warning_count:
+                self.issue_warning(student_id, warning_key, warning_count)
             self.update_instructor_ratings()
             return "Review submitted."
         except sqlite3.IntegrityError:
@@ -487,18 +667,87 @@ class College0DB:
         cur.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,))
         row = cur.fetchone()
         if not row:
-            return
+            return "Complaint not found."
         if punish_against:
-            self.conn.execute(
-                "UPDATE users SET warnings = warnings + 1 WHERE id=?", (row["against_user"],))
+            self.issue_warning(
+                row["against_user"], f"complaint_against_{complaint_id}", 1)
             status = "Resolved - warning issued to accused"
         else:
-            self.conn.execute(
-                "UPDATE users SET warnings = warnings + 1 WHERE id=?", (row["filed_by"],))
+            self.issue_warning(
+                row["filed_by"], f"complaint_filer_{complaint_id}", 1)
             status = "Resolved - warning issued to filer"
         self.conn.execute(
             "UPDATE complaints SET status=? WHERE id=?", (status, complaint_id))
         self.conn.commit()
+        return status
+
+    def run_running_period_audit(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+        SELECT cl.id, cl.instructor_id,
+               (SELECT COUNT(*) FROM registrations r WHERE r.class_id = cl.id) AS enrolled
+        FROM classes cl
+        WHERE cl.cancelled = 0
+        """)
+        affected_students = 0
+        for row in cur.fetchall():
+            if row["enrolled"] < 3:
+                cur.execute(
+                    "SELECT student_id FROM registrations WHERE class_id=?", (row["id"],))
+                student_ids = [item["student_id"] for item in cur.fetchall()]
+                affected_students += len(student_ids)
+                self.conn.execute(
+                    "UPDATE classes SET cancelled=1 WHERE id=?", (row["id"],))
+                self.conn.execute(
+                    "DELETE FROM registrations WHERE class_id=?", (row["id"],))
+                self.conn.execute(
+                    "DELETE FROM waitlist WHERE class_id=?", (row["id"],))
+                if row["instructor_id"]:
+                    self.issue_warning(
+                        row["instructor_id"], f"cancelled_class_{row['id']}", 1)
+
+        cur.execute("SELECT id FROM users WHERE role='Student' AND suspended=0")
+        period_key = "special_registration" if affected_students else "running"
+        for row in cur.fetchall():
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM registrations WHERE student_id=?", (row["id"],))
+            if cur.fetchone()["cnt"] < 2:
+                self.issue_warning(
+                    row["id"], f"{period_key}_underload", 1)
+
+        cur.execute("""
+        SELECT u.id,
+               COUNT(cl.id) AS total_classes,
+               SUM(CASE WHEN cl.cancelled = 1 THEN 1 ELSE 0 END) AS cancelled_classes
+        FROM users u
+        LEFT JOIN classes cl ON cl.instructor_id = u.id
+        WHERE u.role='Instructor'
+        GROUP BY u.id
+        """)
+        for row in cur.fetchall():
+            if row["total_classes"] and row["cancelled_classes"] == row["total_classes"]:
+                self.conn.execute(
+                    "UPDATE users SET suspended=1 WHERE id=?", (row["id"],))
+        self.conn.commit()
+        return affected_students > 0
+
+    def run_grading_period_audit(self):
+        cur = self.conn.cursor()
+        messages = []
+        cur.execute("""
+        SELECT cl.id, cl.instructor_id, c.code
+        FROM classes cl
+        JOIN courses c ON c.id = cl.course_id
+        WHERE cl.cancelled = 0
+        """)
+        for row in cur.fetchall():
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM registrations WHERE class_id=? AND grade=''", (row["id"],))
+            if cur.fetchone()["cnt"] > 0 and row["instructor_id"]:
+                self.issue_warning(
+                    row["instructor_id"], f"missing_grades_{row['id']}", 1)
+                messages.append(f"{row['code']} has missing grades.")
+        return " ".join(messages[:4])
 
     def update_instructor_ratings(self):
         cur = self.conn.cursor()
@@ -513,8 +762,8 @@ class College0DB:
             self.conn.execute(
                 "UPDATE instructor_profiles SET avg_rating=? WHERE user_id=?", (avg_rating, row["instructor_id"]))
             if avg_rating < 2:
-                self.conn.execute(
-                    "UPDATE users SET warnings = warnings + 1 WHERE id=?", (row["instructor_id"],))
+                self.issue_warning(
+                    row["instructor_id"], f"low_average_rating_{row['instructor_id']}", 1)
         self.conn.commit()
 
     def recalculate_gpa(self):
@@ -523,9 +772,12 @@ class College0DB:
         cur = self.conn.cursor()
         for st in self.get_users_by_role("Student"):
             cur.execute(
-                "SELECT grade FROM registrations WHERE student_id=? AND grade <> ''", (st["id"],))
+                "SELECT c.code, r.grade FROM registrations r JOIN classes cl ON cl.id = r.class_id JOIN courses c ON c.id = cl.course_id WHERE r.student_id=? AND r.grade <> ''",
+                (st["id"],),
+            )
+            grade_rows = cur.fetchall()
             grades = [points[g["grade"]]
-                      for g in cur.fetchall() if g["grade"] in points]
+                      for g in grade_rows if g["grade"] in points]
             gpa = round(sum(grades) / len(grades), 2) if grades else 0.0
             honor_roll = 1 if gpa > 3.75 else 0
             self.conn.execute("UPDATE student_profiles SET gpa=?, overall_gpa=?, honor_roll=? WHERE user_id=?",
@@ -534,8 +786,26 @@ class College0DB:
                 self.conn.execute(
                     "UPDATE users SET suspended=1 WHERE id=?", (st["id"],))
             elif 2.0 <= gpa <= 2.25:
-                self.conn.execute(
-                    "UPDATE users SET warnings = warnings + 1 WHERE id=?", (st["id"],))
+                self.issue_warning(st["id"], "gpa_interview_band", 1)
+            failures = {}
+            for row in grade_rows:
+                if row["grade"] == "F":
+                    failures[row["code"]] = failures.get(row["code"], 0) + 1
+            for course_code, count in failures.items():
+                if count >= 2:
+                    self.conn.execute(
+                        "UPDATE users SET suspended=1 WHERE id=?", (st["id"],))
+                    self.add_rule_event(
+                        st["id"], f"failed_same_course_twice_{course_code}")
+            if honor_roll:
+                cur.execute(
+                    "SELECT warnings FROM users WHERE id=?", (st["id"],))
+                warn_row = cur.fetchone()
+                if warn_row and warn_row["warnings"] > 0 and not self.has_rule_event(st["id"], "honor_roll_warning_credit"):
+                    self.conn.execute(
+                        "UPDATE users SET warnings = warnings - 1 WHERE id=?", (st["id"],))
+                    self.add_rule_event(st["id"], "honor_roll_warning_credit")
+            self.refresh_user_status(st["id"])
         self.conn.commit()
 
     def get_user_summary(self, user_id):
@@ -549,6 +819,53 @@ class College0DB:
         WHERE u.id = ?
         """, (user_id,))
         return cur.fetchone()
+
+    def build_local_knowledge(self, user=None):
+        facts = [
+            f"Current semester period: {self.get_current_period()}",
+            f"Student quota: {self.get_student_quota()} active students",
+            "Students normally need GPA above 3.0 and open quota for admission.",
+            "Registration is only open during Registration or Special Registration.",
+            "Reviews are only allowed by enrolled students before grades are posted.",
+        ]
+        top_students, top_classes, low_classes = self.public_rankings()
+        for row in top_students[:3]:
+            facts.append(
+                f"Top GPA student: {row['full_name']} with GPA {row['overall_gpa']}")
+        for row in top_classes[:2]:
+            facts.append(
+                f"Highly rated class: {row['code']} {row['title']} rated {row['avg_stars']}")
+        if user and user["role"] == "Student":
+            for row in self.get_student_registrations(user["id"]):
+                facts.append(
+                    f"Student class: {row['code']} {row['title']} at {row['meeting_time']} grade {row['grade'] or 'not posted'}")
+        if user and user["role"] == "Instructor":
+            for row in self.get_instructor_classes(user["id"]):
+                facts.append(
+                    f"Instructor teaches {row['code']} {row['title']} at {row['meeting_time']}")
+        return facts
+
+    def answer_question(self, question, user=None):
+        question_lower = question.lower().strip()
+        if not question_lower:
+            return "Ask about admissions, registration periods, classes, GPA rules, or your current records."
+        facts = self.build_local_knowledge(user)
+        scored = []
+        tokens = [token for token in question_lower.replace(
+            "?", " ").split() if len(token) > 2]
+        for fact in facts:
+            fact_lower = fact.lower()
+            score = sum(1 for token in tokens if token in fact_lower)
+            if score:
+                scored.append((score, fact))
+        scored.sort(reverse=True)
+        if scored:
+            best = [fact for _, fact in scored[:3]]
+            return "Local college info:\n- " + "\n- ".join(best)
+        return (
+            "No strong match was found in the local college knowledge store. "
+            "In the full project this would be the point to send the question to an LLM, with a hallucination warning."
+        )
 
 
 class College0App:
@@ -570,7 +887,7 @@ class College0App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("EduNavigator - CCNY Style Demo")
+        self.root.title("College0 - CCNY Style Demo")
         self.root.geometry("1300x820")
         self.root.minsize(1180, 760)
         self.root.configure(bg=self.BG)
@@ -583,6 +900,7 @@ class College0App:
         self.public_gpa_entry = None
         self.configure_styles()
         self.build_shell()
+        self.refresh_header_status()
         self.open_main_dashboard()
 
     def configure_styles(self):
@@ -614,7 +932,7 @@ class College0App:
         title_wrap.grid(row=0, column=1)
         tk.Label(
             title_wrap,
-            text="EduNavigator - CCNY Intelligent Academic Navigation System",
+            text="College0 Management System",
             bg=self.NAV,
             fg="white",
             font=("Segoe UI", 22, "bold"),
@@ -779,6 +1097,30 @@ class College0App:
             tk.Label(parent, text=subtitle, bg=self.BG, fg=self.MUTED,
                      font=("Segoe UI", 11)).pack(anchor="w", pady=(6, 0))
 
+    def build_ai_panel(self, parent, user=None, title="College0 AI Assistant"):
+        card, body = self.make_card(
+            parent,
+            title,
+            "Answers come from the local College0 knowledge store first. If nothing matches, the app warns that an external LLM answer could hallucinate.",
+        )
+        question = tk.Text(body, height=4, relief="solid",
+                           bd=1, font=("Segoe UI", 10))
+        question.pack(fill="x", pady=(0, 10))
+        answer = tk.Text(body, height=8, relief="solid", bd=1,
+                         font=("Segoe UI", 10), wrap="word")
+        answer.pack(fill="both", expand=True)
+
+        def ask_ai():
+            response = self.db.answer_question(
+                question.get("1.0", tk.END).strip(), user)
+            answer.delete("1.0", tk.END)
+            answer.insert("1.0", response)
+
+        tk.Button(body, text="Ask AI", command=ask_ai, relief="flat", bg=self.NAV, fg="white",
+                  activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
+                  padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(10, 0))
+        return card
+
     def make_feature_card(self, parent, badge, title, items):
         card = tk.Frame(parent, bg=self.FEATURE_BORDER)
         inner = tk.Frame(card, bg=self.FEATURE)
@@ -794,9 +1136,17 @@ class College0App:
             font=("Segoe UI", 8, "bold"),
             padx=8,
             pady=4,
-        ).pack(side="left")
-        tk.Label(header, text=title, bg=self.FEATURE, fg="white", font=(
-            "Segoe UI", 12, "bold")).pack(side="left", padx=(10, 0))
+        ).pack(anchor="w")
+        tk.Label(
+            header,
+            text=title,
+            bg=self.FEATURE,
+            fg="white",
+            font=("Segoe UI", 11, "bold"),
+            justify="left",
+            anchor="w",
+            wraplength=180,
+        ).pack(anchor="w", fill="x", pady=(8, 0))
 
         tk.Frame(inner, bg="#c78aa0", height=1).pack(fill="x", padx=16)
         body = tk.Frame(inner, bg=self.FEATURE)
@@ -818,7 +1168,7 @@ class College0App:
         self.clear_frame(frame)
         hero = tk.Frame(frame, bg=self.BG)
         hero.pack(fill="x", padx=30, pady=(28, 16))
-        tk.Label(hero, text="Welcome to EduNavigator CCNY", bg=self.BG,
+        tk.Label(hero, text="Welcome to College0", bg=self.BG,
                  fg=self.NAV_DARK, font=("Segoe UI", 30, "bold")).pack()
         tk.Frame(hero, bg=self.BORDER, height=1).pack(
             fill="x", padx=180, pady=14)
@@ -935,6 +1285,8 @@ class College0App:
             pady=10,
             cursor="hand2",
         ).grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=8)
+        ai_card = self.build_ai_panel(frame, None, "Visitor AI Assistant")
+        ai_card.pack(fill="both", expand=True, padx=24, pady=(0, 18))
         return
 
         ranking_row = tk.Frame(frame, bg=self.BG)
@@ -1080,8 +1432,11 @@ class College0App:
                  bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11)).pack(anchor="w")
 
     def refresh_header_status(self):
-        self.header_status.config(
-            text=f"{self.current_user['full_name']} | {self.current_user['role']}" if self.current_user else "Guest mode")
+        if self.current_user:
+            text = f"{self.current_user['full_name']} | {self.current_user['role']} | {self.db.get_current_period()}"
+        else:
+            text = f"Guest mode | {self.db.get_current_period()}"
+        self.header_status.config(text=text)
 
     def prompt_password_change(self, user_id):
         top = tk.Toplevel(self.root)
@@ -1116,6 +1471,7 @@ class College0App:
         frame = self.pages["Dashboard"]
         self.clear_frame(frame)
         user = self.current_user
+        self.refresh_header_status()
         summary = self.db.get_user_summary(user["id"])
         top = tk.Frame(frame, bg=self.BG)
         top.pack(fill="x", padx=24, pady=22)
@@ -1132,7 +1488,7 @@ class College0App:
             ("Warnings", str(summary["warnings"]), self.GOLD),
             ("Status", "Suspended" if summary["suspended"] else "Active",
              self.DANGER if summary["suspended"] else self.SUCCESS),
-            ("Role", user["role"], self.NAV),
+            ("Period", self.db.get_current_period(), self.NAV),
         ]:
             card, body = self.make_card(quick, title)
             card.pack(side="left", fill="both", expand=True, padx=8)
@@ -1163,15 +1519,38 @@ class College0App:
         for a in applications:
             app_list.insert(
                 tk.END, f"#{a['id']}  |  {a['full_name']}  |  {a['role_applied']}  |  GPA {a['gpa']}  |  {a['status']}")
+        tk.Label(app_body, text="Justification (required when you override the student GPA/quota rule)", bg=self.CARD, fg=self.TEXT, font=(
+            "Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 4))
+        app_justification = tk.Text(
+            app_body, height=3, relief="solid", bd=1, font=("Segoe UI", 10))
+        app_justification.pack(fill="x")
+        app_rule_note = tk.Label(
+            app_body, text="", bg=self.CARD, fg=self.MUTED, justify="left", wraplength=420, font=("Segoe UI", 9))
+        app_rule_note.pack(anchor="w", pady=(8, 0))
         btn_row = tk.Frame(app_body, bg=self.CARD)
         btn_row.pack(anchor="w", pady=(10, 0))
+
+        def refresh_rule_note(_event=None):
+            sel = app_list.curselection()
+            if not sel:
+                app_rule_note.config(
+                    text="Select an application to see the requirement-based recommendation.")
+                return
+            action, reason = self.db.evaluate_application_rule(
+                applications[sel[0]])
+            app_rule_note.config(
+                text=f"Recommended action: {action}. {reason}")
+
+        app_list.bind("<<ListboxSelect>>", refresh_rule_note)
+        refresh_rule_note()
 
         def approve():
             sel = app_list.curselection()
             if not sel:
                 return
+            justification = app_justification.get("1.0", tk.END).strip()
             result = self.db.approve_application(
-                applications[sel[0]]["id"], "Approved by registrar.")
+                applications[sel[0]]["id"], justification)
             messagebox.showinfo("Application", result)
             self.build_dashboard()
 
@@ -1179,9 +1558,10 @@ class College0App:
             sel = app_list.curselection()
             if not sel:
                 return
-            self.db.reject_application(
-                applications[sel[0]]["id"], "Rejected by registrar.")
-            messagebox.showinfo("Application", "Application rejected.")
+            justification = app_justification.get("1.0", tk.END).strip()
+            result = self.db.reject_application(
+                applications[sel[0]]["id"], justification)
+            messagebox.showinfo("Application", result)
             self.build_dashboard()
 
         tk.Button(btn_row, text="Approve", command=approve, relief="flat", bg=self.SUCCESS, fg="white",
@@ -1199,6 +1579,39 @@ class College0App:
         for r in self.db.get_reviews():
             review_list.insert(
                 tk.END, f"{r['code']}  |  {r['student_name']}  |  {r['stars']} stars  |  {'Hidden' if r['hidden'] else 'Visible'}  |  {r['visible_text']}")
+
+        control_card, control_body = self.make_card(
+            right, "Semester Controls", "Manage the college period and the student quota from one place")
+        control_card.pack(fill="x", pady=(0, 12))
+        tk.Label(control_body, text=f"Current Period: {self.db.get_current_period()}", bg=self.CARD, fg=self.TEXT, font=(
+            "Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 8))
+        tk.Label(control_body, text="Next Period", bg=self.CARD,
+                 fg=self.TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        period_var = tk.StringVar(value=self.db.get_current_period())
+        ttk.Combobox(control_body, textvariable=period_var, values=[
+                     "Setup", "Registration", "Running", "Grading"], state="readonly").pack(fill="x", pady=(4, 10))
+        tk.Label(control_body, text="Active Student Quota", bg=self.CARD,
+                 fg=self.TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        quota_entry = tk.Entry(control_body, relief="solid",
+                               bd=1, font=("Segoe UI", 10))
+        quota_entry.insert(0, str(self.db.get_student_quota()))
+        quota_entry.pack(fill="x", pady=(4, 10), ipady=4)
+
+        def apply_controls():
+            try:
+                quota = int(quota_entry.get().strip())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid quota", "Student quota must be a whole number.")
+                return
+            self.db.set_setting("student_quota", quota)
+            result = self.db.set_current_period(period_var.get())
+            messagebox.showinfo("Semester", result)
+            self.build_dashboard()
+
+        tk.Button(control_body, text="Apply Controls", command=apply_controls, relief="flat", bg=self.NAV, fg="white",
+                  activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
+                  padx=16, pady=8, cursor="hand2").pack(anchor="w")
 
         taboo_card, taboo_body = self.make_card(
             right, "Taboo Words", "Configured by the registrar")
@@ -1255,9 +1668,94 @@ class College0App:
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=14, pady=8, cursor="hand2").pack(side="left")
 
+        setup_card, setup_body = self.make_card(
+            frame, "Class Setup", "During the Setup period, the registrar can adjust instructor, meeting time, and capacity.")
+        setup_card.pack(fill="x", padx=24, pady=(12, 0))
+        setup_row = tk.Frame(setup_body, bg=self.CARD)
+        setup_row.pack(fill="x")
+        class_setup_rows = self.db.get_class_setup_rows()
+        class_setup_list = self.styled_listbox(setup_row, height=6)
+        class_setup_list.pack(side="left", fill="both",
+                              expand=True, padx=(0, 12))
+        for row_data in class_setup_rows:
+            class_setup_list.insert(
+                tk.END, f"#{row_data['id']} | {row_data['code']} {row_data['title']} | {row_data['meeting_time']} | cap {row_data['capacity']} | {row_data['instructor'] or 'TBD'}")
+
+        setup_form = tk.Frame(setup_row, bg=self.CARD)
+        setup_form.pack(side="left", fill="y")
+        instructor_rows = self.db.get_users_by_role("Instructor")
+        instructor_map = {
+            f"{u['full_name']} ({u['username']})": u["id"] for u in instructor_rows}
+        tk.Label(setup_form, text="Instructor", bg=self.CARD,
+                 fg=self.TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        instructor_var = tk.StringVar()
+        instructor_box = ttk.Combobox(
+            setup_form, textvariable=instructor_var, values=list(instructor_map.keys()), state="readonly", width=32)
+        instructor_box.pack(fill="x", pady=(4, 10))
+        tk.Label(setup_form, text="Meeting Time", bg=self.CARD,
+                 fg=self.TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        meeting_entry = tk.Entry(
+            setup_form, relief="solid", bd=1, font=("Segoe UI", 10))
+        meeting_entry.pack(fill="x", pady=(4, 10), ipady=4)
+        tk.Label(setup_form, text="Capacity", bg=self.CARD,
+                 fg=self.TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        capacity_entry = tk.Entry(
+            setup_form, relief="solid", bd=1, font=("Segoe UI", 10))
+        capacity_entry.pack(fill="x", pady=(4, 10), ipady=4)
+
+        def load_setup_form(_event=None):
+            sel = class_setup_list.curselection()
+            if not sel:
+                return
+            class_row = class_setup_rows[sel[0]]
+            meeting_entry.delete(0, tk.END)
+            meeting_entry.insert(0, class_row["meeting_time"])
+            capacity_entry.delete(0, tk.END)
+            capacity_entry.insert(0, str(class_row["capacity"]))
+            for label, user_id in instructor_map.items():
+                if user_id == class_row["instructor_id"]:
+                    instructor_var.set(label)
+                    break
+
+        class_setup_list.bind("<<ListboxSelect>>", load_setup_form)
+
+        def save_setup():
+            sel = class_setup_list.curselection()
+            if not sel:
+                return
+            target = class_setup_rows[sel[0]]
+            try:
+                capacity = int(capacity_entry.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid capacity",
+                                     "Capacity must be a whole number.")
+                return
+            instructor_id = instructor_map.get(instructor_var.get())
+            if not instructor_id:
+                messagebox.showerror("Missing instructor",
+                                     "Please choose an instructor.")
+                return
+            result = self.db.update_class_setup(
+                target["id"], instructor_id, meeting_entry.get().strip(), capacity)
+            messagebox.showinfo("Class Setup", result)
+            self.build_dashboard()
+
+        tk.Button(setup_form, text="Save Class Setup", command=save_setup, relief="flat", bg=self.GOLD, fg=self.NAV,
+                  activebackground="#c79310", activeforeground=self.NAV, font=("Segoe UI", 10, "bold"),
+                  padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(4, 0))
+        ai_card = self.build_ai_panel(
+            frame, self.current_user, "Registrar AI Assistant")
+        ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
+
     def build_student_dashboard(self, frame):
         row = tk.Frame(frame, bg=self.BG)
         row.pack(fill="both", expand=True, padx=24, pady=8)
+        tip_card, tip_body = self.make_card(
+            row, "Student Tutorial", "New students should start here: keep 2-4 courses, watch period changes, and submit reviews before grades are posted.")
+        tip_card.pack(fill="x", pady=(0, 14))
+        tk.Label(tip_body, text="1. Register only during Registration or Special Registration.\n2. Keep at least 2 courses to avoid a warning.\n3. Reviews are only allowed while you are in the class and before the grade is posted.\n4. Warnings of 3 or more can suspend your account.",
+                 bg=self.CARD, fg=self.TEXT, justify="left", font=("Segoe UI", 10)).pack(anchor="w")
+
         top = tk.Frame(row, bg=self.BG)
         top.pack(fill="x")
 
@@ -1370,6 +1868,9 @@ class College0App:
         tk.Button(complaint_body, text="Submit Complaint", command=file_complaint, relief="flat", bg=self.NAV, fg="white",
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(12, 0))
+        ai_card = self.build_ai_panel(
+            frame, self.current_user, "Student AI Assistant")
+        ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
 
     def build_instructor_dashboard(self, frame):
         row = tk.Frame(frame, bg=self.BG)
@@ -1421,19 +1922,17 @@ class College0App:
             current_waiters = self.db.get_waitlist(class_id)
             for s in current_students:
                 students_list.insert(
-                    tk.END, f"{s['full_name']}  |  Grade: {s['grade'] or 'N/A'}")
+                    tk.END, f"{s['full_name']} ({s['username']})  |  GPA: {s['overall_gpa'] or 0.0}  |  Warnings: {s['warnings']}  |  Honor Roll: {'Yes' if s['honor_roll'] else 'No'}  |  Grade: {s['grade'] or 'N/A'}")
             for w in current_waiters:
                 wait_list.insert(tk.END, f"{w['full_name']}")
-
-        class_list.bind("<<ListboxSelect>>", load_class_data)
 
         def assign_grade():
             sel = students_list.curselection()
             if not sel:
                 return
-            self.db.assign_grade(
+            msg = self.db.assign_grade(
                 current_students[sel[0]]["id"], grade_var.get())
-            messagebox.showinfo("Grade", "Grade saved.")
+            messagebox.showinfo("Grade", msg)
             load_class_data()
 
         def admit_waiter():
@@ -1452,6 +1951,65 @@ class College0App:
         tk.Button(wait_body, text="Admit Selected Student", command=admit_waiter, relief="flat", bg=self.NAV, fg="white",
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(10, 0))
+
+        extra = tk.Frame(row, bg=self.BG)
+        extra.pack(fill="both", expand=True, pady=(14, 0))
+        complaint_card, complaint_body = self.make_card(
+            extra, "Instructor Complaint", "Report a student in your class to the registrar.")
+        complaint_card.pack(side="left", fill="both",
+                            expand=True, padx=(0, 10))
+        ai_card = self.build_ai_panel(
+            extra, self.current_user, "Instructor AI Assistant")
+        ai_card.pack(side="left", fill="both", expand=True, padx=(10, 0))
+
+        tk.Label(complaint_body, text="Student in Selected Class", bg=self.CARD,
+                 fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 6))
+        complaint_target_var = tk.StringVar()
+        complaint_target_box = ttk.Combobox(
+            complaint_body, textvariable=complaint_target_var, values=[], state="readonly")
+        complaint_target_box.pack(fill="x")
+        tk.Label(complaint_body, text="Complaint Detail", bg=self.CARD, fg=self.TEXT, font=(
+            "Segoe UI", 10, "bold")).pack(anchor="w", pady=(12, 6))
+        instructor_complaint_text = tk.Text(
+            complaint_body, height=6, relief="solid", bd=1, font=("Segoe UI", 10))
+        instructor_complaint_text.pack(fill="both", expand=True)
+
+        def refresh_complaint_targets(_event=None):
+            values = [
+                f"{s['full_name']} ({s['username']})" for s in current_students]
+            complaint_target_box["values"] = values
+            if values:
+                complaint_target_var.set(values[0])
+            else:
+                complaint_target_var.set("")
+
+        class_list.bind("<<ListboxSelect>>", lambda event: (
+            load_class_data(event), refresh_complaint_targets(event)))
+
+        def file_instructor_complaint():
+            target_text = complaint_target_var.get()
+            detail = instructor_complaint_text.get("1.0", tk.END).strip()
+            if not target_text or not detail:
+                messagebox.showerror(
+                    "Missing info", "Select a class, choose a student, and enter complaint details.")
+                return
+            target = next(
+                (s for s in current_students if f"{s['full_name']} ({s['username']})" == target_text),
+                None,
+            )
+            if not target:
+                messagebox.showerror(
+                    "Missing student", "Please choose a student from the selected class.")
+                return
+            self.db.file_complaint(
+                self.current_user["id"], target["student_id"], detail)
+            messagebox.showinfo(
+                "Complaint", "Complaint submitted to the registrar.")
+            self.build_dashboard()
+
+        tk.Button(complaint_body, text="Submit Complaint", command=file_instructor_complaint, relief="flat", bg=self.NAV, fg="white",
+                  activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
+                  padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(12, 0))
 
 
 if __name__ == "__main__":
