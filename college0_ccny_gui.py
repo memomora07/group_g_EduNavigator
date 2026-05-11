@@ -121,6 +121,17 @@ class College0DB:
         )
         """)
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS graduation_applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            status TEXT DEFAULT 'Pending',
+            decision_note TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(student_id) REFERENCES users(id)
+        )
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS taboo_words (
             word TEXT PRIMARY KEY
         )
@@ -644,6 +655,86 @@ class College0DB:
         self.conn.execute("INSERT INTO complaints(filed_by, against_user, detail) VALUES (?, ?, ?)",
                           (filed_by, against_user, detail))
         self.conn.commit()
+    def apply_for_graduation(self, student_id):
+        cur = self.conn.cursor()
+        
+        cur.execute("""
+            SELECT COUNT(*) AS cnt
+            FROM registrations
+            WHERE student_id=? AND grade <> ''
+        """, (student_id,))
+        completed = cur.fetchone()["cnt"]
+        
+        cur.execute("""
+            SELECT c.code
+            FROM courses c
+            WHERE c.required = 1
+            AND c.code NOT IN (
+                SELECT co.code
+                FROM registrations r
+                JOIN classes cl ON cl.id = r.class_id
+                JOIN courses co ON co.id = cl.course_id
+                WHERE r.student_id=? AND r.grade NOT IN ('', 'F')
+            )
+        """, (student_id,))
+        missing_required = [row["code"] for row in cur.fetchall()]
+        
+        if completed < 8 or missing_required:
+            self.issue_warning(student_id, "reckless_graduation_application", 1)
+            self.conn.execute("""
+                INSERT INTO graduation_applications(student_id, status, decision_note, created_at)
+                VALUES (?, 'Rejected', ?, ?)
+            """, (
+                student_id,
+                f"Rejected automatically. Completed classes: {completed}/8. Missing required: {', '.join(missing_required) if missing_required else 'None'}. Warning issued.",
+                datetime.now().isoformat()
+            ))
+            self.conn.commit()
+            return "Graduation rejected. You need 8 completed classes and all required courses. Warning issued."
+        
+        self.conn.execute("""
+            INSERT INTO graduation_applications(student_id, status, decision_note, created_at)
+            VALUES (?, 'Pending', 'Eligible for registrar review.', ?)
+        """, (student_id, datetime.now().isoformat()))
+        self.conn.commit()
+        return "Graduation application submitted for registrar review."
+    
+    def get_graduation_applications(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT ga.id, ga.status, ga.decision_note, ga.created_at,
+                   u.full_name, u.username
+            FROM graduation_applications ga
+            JOIN users u ON u.id = ga.student_id
+            ORDER BY ga.id DESC
+        """)
+        return cur.fetchall()
+
+
+    def decide_graduation(self, grad_id, approve=True, note=""):
+        cur = self.conn.cursor()
+        status = "Approved" if approve else "Rejected"
+        final_note = note.strip() or status
+
+        cur.execute("SELECT student_id FROM graduation_applications WHERE id=?", (grad_id,))
+        row = cur.fetchone()
+        if not row:
+            return "Graduation application not found."
+        
+        self.conn.execute("""
+            UPDATE graduation_applications
+            SET status=?, decision_note=?
+            WHERE id=?
+        """, (status, final_note, grad_id))
+
+        if approve:
+            self.conn.execute(
+                "UPDATE users SET suspended=1 WHERE id=?",
+                (row["student_id"],)
+            )
+
+        self.conn.commit()
+        return f"Graduation application {status.lower()}."
 
     def get_users_by_role(self, role):
         cur = self.conn.cursor()
@@ -973,6 +1064,7 @@ class College0App:
             ("Login", lambda: self.show_page("Login", "Login")),
             ("Submit Review", self.open_review_page),
             ("File Complaint", self.open_complaint_page),
+            ("AI Assistant", self.open_ai_page),
             ("Help", self.show_help),
             ("Exit", self.root.destroy),
         ]
@@ -1021,7 +1113,7 @@ class College0App:
             justify="left",
         ).pack(anchor="w", padx=20)
 
-        for page in ["Public", "Login", "Dashboard", "Review", "Complaint"]:
+        for page in ["Public", "Login", "Dashboard", "Review", "Complaint", "AI"]:
             self.pages[page] = tk.Frame(self.content, bg=self.BG)
 
         self.build_public_page()
@@ -1072,7 +1164,30 @@ class College0App:
             return
         self.build_complaint_page()
         self.show_page("Complaint", "File Complaint")
+    
+    def open_ai_page(self):
+        self.build_ai_page()
+        self.show_page("AI", "AI Assistant")
 
+    def build_ai_page(self):
+        frame = self.pages["AI"]
+        self.clear_frame(frame)
+        
+        wrapper = tk.Frame(frame, bg=self.BG)
+        wrapper.pack(fill="both", expand=True, padx=24, pady=24)
+        
+        self.section_title(
+            wrapper,
+            "College0 AI Assistant",
+            "Ask questions about registrations, GPA, classes, reviews, warnings, and semester rules."
+            )
+        ai_card = self.build_ai_panel(
+            wrapper,
+            self.current_user,
+            "AI College Assistant"
+            )
+        
+        ai_card.pack(fill="both", expand=True, pady=(20, 0))
 
     def show_help(self):
         messagebox.showinfo(
@@ -1803,6 +1918,24 @@ class College0App:
         for c in classes:
             class_list.insert(
                 tk.END, f"#{c['id']}  |  {c['code']} {c['title']}  |  {c['meeting_time']}  |  {c['enrolled']}/{c['capacity']}  |  {c['period_state']}")
+            
+        def apply_grad():
+            msg = self.db.apply_for_graduation(self.current_user["id"])
+            messagebox.showinfo("Graduation", msg)
+            self.build_dashboard()
+
+        tk.Button(
+            my_body,
+            text="Apply for Graduation",
+            command=apply_grad,
+            relief="flat",
+            bg=self.GOLD,
+            fg=self.NAV,
+            font=("Segoe UI", 10, "bold"),
+            padx=16,
+            pady=8,
+            cursor="hand2"
+        ).pack(anchor="w", pady=(10, 0))
 
         def register():
             sel = class_list.curselection()
