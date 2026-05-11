@@ -971,30 +971,38 @@ class College0App:
             ("Apply as Student", lambda: self.open_public_application("Student")),
             ("Apply as Instructor", lambda: self.open_public_application("Instructor")),
             ("Login", lambda: self.show_page("Login", "Login")),
+            ("Submit Review", self.open_review_page),
+            ("File Complaint", self.open_complaint_page),
             ("Help", self.show_help),
             ("Exit", self.root.destroy),
         ]
         for label, command in nav_items:
-            btn = tk.Button(
+            btn = tk.Label(
                 self.sidebar,
                 text=label,
                 anchor="w",
-                relief="flat",
-                bd=0,
                 bg=self.NAV,
                 fg="white",
-                activebackground=self.NAV_LIGHT,
-                activeforeground="white",
                 font=("Segoe UI", 11, "bold"),
                 padx=22,
                 pady=16,
-                command=command,
                 cursor="hand2",
             )
+
             btn.pack(fill="x")
-            tk.Frame(self.sidebar, bg="#8065ac",
-                     height=1).pack(fill="x", padx=14)
+
+            btn.bind("<Button-1>", lambda e, cmd=command: cmd())
+            btn.bind("<Enter>", lambda e, b=btn: b.configure(bg=self.NAV_LIGHT))
+            btn.bind("<Leave>", lambda e, b=btn: b.configure(bg=self.NAV))
+
+            tk.Frame(
+                self.sidebar,
+                bg="#8065ac",
+                height=1
+            ).pack(fill="x", padx=14)
+
             self.nav_buttons[label] = btn
+
 
         tk.Label(self.sidebar, text="Demo Access", bg=self.NAV, fg=self.GOLD, font=(
             "Segoe UI", 10, "bold")).pack(anchor="w", padx=20, pady=(18, 4))
@@ -1013,7 +1021,7 @@ class College0App:
             justify="left",
         ).pack(anchor="w", padx=20)
 
-        for page in ["Public", "Login", "Dashboard"]:
+        for page in ["Public", "Login", "Dashboard", "Review", "Complaint"]:
             self.pages[page] = tk.Frame(self.content, bg=self.BG)
 
         self.build_public_page()
@@ -1050,6 +1058,21 @@ class College0App:
     def open_public_application(self, role):
         self.show_page("Public", f"Apply as {role}")
         self.set_public_role(role)
+    
+    def open_review_page(self):
+        if not self.current_user or self.current_user["role"] != "Student":
+            messagebox.showerror("Access denied", "Please log in as a student first.")
+            return
+        self.build_review_page()
+        self.show_page("Review", "Submit Review")
+    
+    def open_complaint_page(self):
+        if not self.current_user or self.current_user["role"] != "Student":
+            messagebox.showerror("Access denied", "Please log in as a student first.")
+            return
+        self.build_complaint_page()
+        self.show_page("Complaint", "File Complaint")
+
 
     def show_help(self):
         messagebox.showinfo(
@@ -1239,9 +1262,17 @@ class College0App:
         tk.Label(form, text="Apply As", bg=self.CARD, fg=self.TEXT, font=(
             "Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w", padx=6, pady=6)
         self.public_role_var = tk.StringVar(value="Student")
-        ttk.Combobox(form, textvariable=self.public_role_var, values=[
-                     "Student", "Instructor"], width=20, state="readonly").grid(row=1, column=1, padx=6, pady=(0, 10), sticky="we")
-
+        tk.Entry(
+             form,
+             textvariable=self.public_role_var,
+             width=20,
+             relief="solid",
+             bd=1,
+             font=("Segoe UI", 10),
+             state="readonly",
+            readonlybackground=self.CARD,
+            fg=self.TEXT,
+            ).grid(row=1, column=1, padx=6, pady=(0, 10), sticky="we")
         tk.Label(form, text="GPA", bg=self.CARD, fg=self.TEXT, font=(
             "Segoe UI", 10, "bold")).grid(row=0, column=2, sticky="w", padx=6, pady=6)
         self.public_gpa_entry = tk.Entry(
