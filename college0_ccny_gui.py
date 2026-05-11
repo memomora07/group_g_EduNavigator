@@ -1889,6 +1889,60 @@ class College0App:
         tk.Button(setup_form, text="Save Class Setup", command=save_setup, relief="flat", bg=self.GOLD, fg=self.NAV,
                   activebackground="#c79310", activeforeground=self.NAV, font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(4, 0))
+        
+        grad_card, grad_body = self.make_card(
+            frame,
+            "Graduation Applications",
+            "Review student graduation requests."
+        )
+        grad_card.pack(fill="x", padx=24, pady=(12, 0))
+        
+        grad_apps = self.db.get_graduation_applications()
+        grad_list = self.styled_listbox(grad_body, height=6)
+        grad_list.pack(fill="x")
+        
+        for g in grad_apps:
+            grad_list.insert(
+                tk.END,
+                f"#{g['id']} | {g['full_name']} ({g['username']}) | {g['status']} | {g['decision_note']}"
+            )
+            
+        note_box = tk.Text(grad_body, height=3, relief="solid", bd=1, font=("Segoe UI", 10))
+        note_box.pack(fill="x", pady=(10, 0))
+
+        def approve_grad():
+            sel = grad_list.curselection()
+            if not sel:
+                return
+            msg = self.db.decide_graduation(
+                grad_apps[sel[0]]["id"],
+                True,
+                note_box.get("1.0", tk.END)
+            )
+            messagebox.showinfo("Graduation", msg)
+            self.build_dashboard()
+            
+        def reject_grad():
+            sel = grad_list.curselection()
+            if not sel:
+                return
+            msg = self.db.decide_graduation(
+                grad_apps[sel[0]]["id"],
+                False,
+                note_box.get("1.0", tk.END)
+            )
+            messagebox.showinfo("Graduation", msg)
+            self.build_dashboard()
+
+        btns = tk.Frame(grad_body, bg=self.CARD)
+        btns.pack(anchor="w", pady=(10, 0))
+
+        tk.Button(btns, text="Approve Graduation", command=approve_grad, bg=self.SUCCESS, fg="white",
+                  relief="flat", padx=14, pady=8, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
+
+        tk.Button(btns, text="Reject Graduation", command=reject_grad, bg=self.DANGER, fg="white",
+                  relief="flat", padx=14, pady=8, font=("Segoe UI", 10, "bold")).pack(side="left")
+        
         ai_card = self.build_ai_panel(
             frame, self.current_user, "Registrar AI Assistant")
         ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
