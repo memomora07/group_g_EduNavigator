@@ -1410,13 +1410,14 @@ class College0App:
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(10, 0))
         return card
 
-    def make_feature_card(self, parent, badge, title, items):
+    def make_feature_card(self, parent, badge, title, items, extra_items=None):
         card = tk.Frame(parent, bg=self.FEATURE_BORDER)
         inner = tk.Frame(card, bg=self.FEATURE)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
 
         header = tk.Frame(inner, bg=self.FEATURE)
         header.pack(fill="x", padx=16, pady=(14, 10))
+
         tk.Label(
             header,
             text=badge,
@@ -1426,6 +1427,7 @@ class College0App:
             padx=8,
             pady=4,
         ).pack(anchor="w")
+
         tk.Label(
             header,
             text=title,
@@ -1438,8 +1440,10 @@ class College0App:
         ).pack(anchor="w", fill="x", pady=(8, 0))
 
         tk.Frame(inner, bg="#c78aa0", height=1).pack(fill="x", padx=16)
+
         body = tk.Frame(inner, bg=self.FEATURE)
         body.pack(fill="both", expand=True, padx=18, pady=12)
+
         for item in items:
             tk.Label(
                 body,
@@ -1450,17 +1454,63 @@ class College0App:
                 justify="left",
                 font=("Segoe UI", 10),
             ).pack(anchor="w", pady=4)
+
+        if extra_items:
+            dropdown_frame = tk.Frame(body, bg=self.FEATURE)
+
+            def toggle_dropdown():
+                if dropdown_frame.winfo_ismapped():
+                    dropdown_frame.pack_forget()
+                    view_btn.config(text="Click to view more")
+                else:
+                    dropdown_frame.pack(anchor="w", fill="x", pady=(8, 0))
+                    view_btn.config(text="Hide list")
+
+            view_btn = tk.Button(
+                body,
+                text="Click to view more",
+                command=toggle_dropdown,
+                bg=self.GOLD,
+                fg=self.NAV_DARK,
+                relief="flat",
+                font=("Segoe UI", 9, "bold"),
+                cursor="hand2",
+            )
+            view_btn.pack(anchor="w", pady=(10, 0))
+
+            for item in extra_items:
+                tk.Label(
+                    dropdown_frame,
+                    text=f"• {item}",
+                    bg=self.FEATURE,
+                    fg="white",
+                    wraplength=220,
+                    justify="left",
+                    font=("Segoe UI", 9),
+                ).pack(anchor="w", pady=2)
+
         return card
+    ####
 
     def build_public_page(self):
         frame = self.pages["Public"]
         self.clear_frame(frame)
+
         hero = tk.Frame(frame, bg=self.BG)
         hero.pack(fill="x", padx=30, pady=(28, 16))
-        tk.Label(hero, text="Welcome to College0", bg=self.BG,
-                 fg=self.NAV_DARK, font=("Segoe UI", 30, "bold")).pack()
+
+        tk.Label(
+            hero,
+            text="Welcome to College0",
+            bg=self.BG,
+            fg=self.NAV_DARK,
+            font=("Segoe UI", 30, "bold"),
+        ).pack()
+
         tk.Frame(hero, bg=self.BORDER, height=1).pack(
-            fill="x", padx=180, pady=14)
+            fill="x", padx=180, pady=14
+        )
+
         tk.Label(
             hero,
             text="An AI-enabled college management system with a CCNY-inspired campus theme.",
@@ -1471,36 +1521,85 @@ class College0App:
 
         ranking_row = tk.Frame(frame, bg=self.BG)
         ranking_row.pack(fill="x", padx=24, pady=(0, 10))
+
         top_students, top_classes, low_classes = self.db.public_rankings()
-        student_items = [f"{r['full_name']} - GPA {r['overall_gpa']}" for r in top_students] or [
+
+        student_items = [
+            f"{r['full_name']} - GPA {r['overall_gpa']}" for r in top_students
+        ] or [
             "Amy S. - GPA 3.9",
             "John D. - GPA 3.8",
             "Linda K. - GPA 3.7",
         ]
-        top_class_items = [f"{r['code']} {r['title']} ({r['avg_stars']})" for r in top_classes] or [
+
+        top_class_items = [
+            f"{r['code']} {r['title']} ({r['avg_stars']})" for r in top_classes
+        ] or [
             "Advanced Python (4.8)",
             "Data Science (4.6)",
             "Creative Writing (4.5)",
         ]
-        low_class_items = [f"{r['code']} {r['title']} ({r['avg_stars']})" for r in low_classes] or [
+
+        low_class_items = [
+            f"{r['code']} {r['title']} ({r['avg_stars']})" for r in low_classes
+        ] or [
             "Intro to Algebra (2.3)",
             "History 101 (2.5)",
             "Art Appreciation (2.6)",
         ]
-        groups = [
-            ("TOP", "Top Rated Classes", top_class_items),
-            ("LOW", "Lowest Rated Classes", low_class_items),
-            ("GPA", "Highest GPA Students", student_items),
-            ("CCNY", "College Highlights", [
-             "Small college community", "Hands-on learning", "AI-enabled assistance"]),
+
+        top_more_items = [
+            "Machine Learning (4.7)",
+            "Web Development (4.6)",
+            "Cybersecurity Basics (4.5)",
+            "Calculus II (4.4)",
+            "Linear Algebra (4.3)",
+            "Operating Systems (4.2)",
+            "Computer Graphics (4.1)",
+            "Mobile App Design (4.0)",
+            "Human-Computer Interaction (3.9)",
+            "Intro to AI (3.8)",
         ]
-        for badge, title, items in groups:
-            card = self.make_feature_card(ranking_row, badge, title, items)
+
+        low_more_items = [
+            "Statistics Lab (2.7)",
+            "Chemistry Recitation (2.6)",
+            "Physics I (2.5)",
+            "Public Speaking (2.4)",
+            "Technical Writing (2.4)",
+            "Biology Lab (2.3)",
+            "Economics 101 (2.2)",
+            "Pre-Calculus (2.1)",
+            "Philosophy 101 (2.0)",
+            "World History (1.9)",
+        ]
+
+        groups = [
+            ("TOP", "Top Rated Classes", top_class_items, top_more_items),
+            ("LOW", "Lowest Rated Classes", low_class_items, low_more_items),
+            ("GPA", "Highest GPA Students", student_items, None),
+            (
+                "CCNY",
+                "College Highlights",
+                [
+                    "Small college community",
+                    "Hands-on learning",
+                    "AI-enabled assistance",
+                ],
+                None,
+            ),
+        ]
+
+        for badge, title, items, extra_items in groups:
+            card = self.make_feature_card(
+                ranking_row, badge, title, items, extra_items
+            )
             card.pack(side="left", fill="both", expand=True, padx=8)
 
         banner = tk.Frame(frame, bg=self.BANNER, height=46)
         banner.pack(fill="x", padx=28, pady=(14, 18))
         banner.pack_propagate(False)
+
         tk.Label(
             banner,
             text="Prospective students and instructors can apply to College0 using the form below.",
@@ -1510,45 +1609,117 @@ class College0App:
         ).pack(expand=True)
 
         app_card, app_body = self.make_card(
-            frame, "Visitor Application", "Apply as a student or instructor while keeping the same project workflow.")
+            frame,
+            "Visitor Application",
+            "Apply as a student or instructor while keeping the same project workflow.",
+        )
         app_card.pack(fill="x", padx=24, pady=16)
+
         form = tk.Frame(app_body, bg=self.CARD)
         form.pack(fill="x")
         form.grid_columnconfigure(0, weight=1)
         form.grid_columnconfigure(1, weight=1)
         form.grid_columnconfigure(2, weight=1)
 
-        tk.Label(form, text="Full Name", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        self.public_name_entry = tk.Entry(
-            form, width=34, relief="solid", bd=1, font=("Segoe UI", 10))
-        self.public_name_entry.grid(
-            row=1, column=0, padx=6, pady=(0, 10), sticky="we")
+        tk.Label(
+            form,
+            text="Full Name",
+            bg=self.CARD,
+            fg=self.TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
 
-        tk.Label(form, text="Apply As", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w", padx=6, pady=6)
+        self.public_name_entry = tk.Entry(
+            form, width=34, relief="solid", bd=1, font=("Segoe UI", 10)
+        )
+        self.public_name_entry.grid(
+            row=1, column=0, padx=6, pady=(0, 10), sticky="we"
+        )
+
+        tk.Label(
+            form,
+            text="Apply As",
+            bg=self.CARD,
+            fg=self.TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=1, sticky="w", padx=6, pady=6)
+
         self.public_role_var = tk.StringVar(value="Student")
+
         tk.Entry(
-             form,
-             textvariable=self.public_role_var,
-             width=20,
-             relief="solid",
-             bd=1,
-             font=("Segoe UI", 10),
-             state="readonly",
+            form,
+            textvariable=self.public_role_var,
+            width=20,
+            relief="solid",
+            bd=1,
+            font=("Segoe UI", 10),
+            state="readonly",
             readonlybackground=self.CARD,
             fg=self.TEXT,
-            ).grid(row=1, column=1, padx=6, pady=(0, 10), sticky="we")
-        tk.Label(form, text="GPA", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=0, column=2, sticky="w", padx=6, pady=6)
+        ).grid(row=1, column=1, padx=6, pady=(0, 10), sticky="we")
+
+        tk.Label(
+            form,
+            text="GPA",
+            bg=self.CARD,
+            fg=self.TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=2, sticky="w", padx=6, pady=6)
+
         self.public_gpa_entry = tk.Entry(
-            form, width=12, relief="solid", bd=1, font=("Segoe UI", 10))
+            form, width=12, relief="solid", bd=1, font=("Segoe UI", 10)
+        )
         self.public_gpa_entry.insert(0, "3.20")
         self.public_gpa_entry.grid(
-            row=1, column=2, padx=6, pady=(0, 10), sticky="we")
+            row=1, column=2, padx=6, pady=(0, 10), sticky="we"
+        )
 
-        tk.Label(form, text="Student applications use GPA. Instructor applications can leave GPA at 0.00.", bg=self.CARD,
-                 fg=self.MUTED, font=("Segoe UI", 9)).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 10))
+        tk.Label(
+            form,
+            text="Student applications use GPA. Instructor applications can leave GPA at 0.00.",
+            bg=self.CARD,
+            fg=self.MUTED,
+            font=("Segoe UI", 9),
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 10))
+
+        def submit_app():
+            name = self.public_name_entry.get().strip()
+            role = self.public_role_var.get()
+
+            try:
+                gpa = float(self.public_gpa_entry.get().strip() or 0)
+            except ValueError:
+                messagebox.showerror("Invalid GPA", "Enter a numeric GPA.")
+                return
+
+            if not name:
+                messagebox.showerror(
+                    "Missing name", "Please enter the applicant's full name."
+                )
+                return
+
+            self.db.submit_application(name, role, gpa)
+            messagebox.showinfo("Submitted", "Application submitted successfully.")
+            self.public_name_entry.delete(0, tk.END)
+            self.set_public_role("Student")
+
+        tk.Button(
+            form,
+            text="Submit Application",
+            command=submit_app,
+            relief="flat",
+            bg=self.GOLD,
+            fg=self.NAV,
+            activebackground="#d8b96d",
+            activeforeground=self.NAV,
+            font=("Segoe UI", 10, "bold"),
+            padx=18,
+            pady=10,
+            cursor="hand2",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=8)
+
+        ai_card = self.build_ai_panel(frame, None, "Visitor AI Assistant")
+        ai_card.pack(fill="both", expand=True, padx=24, pady=(0, 18))
 
         def submit_app():
             name = self.public_name_entry.get().strip()
