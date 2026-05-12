@@ -1164,10 +1164,143 @@ class College0App:
             return
         self.build_complaint_page()
         self.show_page("Complaint", "File Complaint")
+    def build_complaint_page(self):
+        frame = self.pages["Complaint"]
+        self.clear_frame(frame)
+
+        wrapper = tk.Frame(frame, bg=self.BG)
+        wrapper.pack(fill="both", expand=True, padx=24, pady=24)
+
+        self.section_title(wrapper, "File Complaint", "Report an issue with another user")
+
+        card, body = self.make_card(wrapper, "Complaint Form")
+        card.pack(fill="x", pady=20)
+
+        tk.Label(body, text="Select User", bg=self.CARD).pack(anchor="w")
+
+        users = self.db.get_users_by_role("Instructor") + self.db.get_users_by_role("Student")
+
+        user_map = {}
+        user_var = tk.StringVar()
+
+        dropdown = ttk.Combobox(body, textvariable=user_var, state="readonly")
+        dropdown.pack(fill="x", pady=5)
+
+        values = []
+        for u in users:
+            label = f"{u['full_name']} ({u['username']})"
+            user_map[label] = u["id"]
+            values.append(label)
+
+        dropdown["values"] = values
+
+        tk.Label(body, text="Complaint Detail", bg=self.CARD).pack(anchor="w")
+        detail_box = tk.Text(body, height=4)
+        detail_box.pack(fill="x", pady=5)
+
+        def submit():
+            selected = user_var.get()
+            if not selected:
+                messagebox.showerror("Error", "Select a user")
+                return
+
+            detail = detail_box.get("1.0", tk.END).strip()
+            if not detail:
+                messagebox.showerror("Error", "Enter complaint detail")
+                return
+
+            self.db.file_complaint(
+                self.current_user["id"],
+                user_map[selected],
+                detail
+            )
+
+            messagebox.showinfo("Success", "Complaint submitted")
+
+        tk.Button(body, text="Submit Complaint",
+                command=submit,
+                bg=self.NAV, fg="white").pack(pady=10)
     
     def open_ai_page(self):
         self.build_ai_page()
         self.show_page("AI", "AI Assistant")
+
+    def build_review_page(self):
+        frame = self.pages["Review"]
+        self.clear_frame(frame)
+
+        wrapper = tk.Frame(frame, bg=self.BG)
+        wrapper.pack(fill="both", expand=True, padx=24, pady=24)
+
+        self.section_title(wrapper, "Submit Review", "Leave feedback for your classes")
+
+        card, body = self.make_card(wrapper, "Review Form")
+        card.pack(fill="x", pady=20)
+
+    
+        classes = self.db.get_student_registrations(self.current_user["id"])
+
+        class_map = {}
+        class_var = tk.StringVar()
+
+        tk.Label(body, text="Select Class", bg=self.CARD).pack(anchor="w")
+
+        dropdown = ttk.Combobox(body, textvariable=class_var, state="readonly")
+        dropdown.pack(fill="x", pady=5)
+
+        values = []
+        for c in classes:
+            label = f"{c['code']} - {c['title']}"
+            class_map[label] = c["class_id"]
+            values.append(label)
+
+        dropdown["values"] = values
+
+    
+        tk.Label(body, text="Stars (1-5)", bg=self.CARD).pack(anchor="w")
+        stars_entry = tk.Entry(body)
+        stars_entry.pack(fill="x", pady=5)
+
+    # Review text
+        tk.Label(body, text="Review", bg=self.CARD).pack(anchor="w")
+        review_box = tk.Text(body, height=4)
+        review_box.pack(fill="x", pady=5)
+
+    
+
+        def submit():
+            selected = class_var.get()
+            if not selected:
+                messagebox.showerror("Error", "Select a class")
+                return
+
+            try:
+                stars = int(stars_entry.get())
+                if stars < 1 or stars > 5:
+                    raise ValueError
+            except:
+                messagebox.showerror("Error", "Stars must be 1-5")
+                return
+
+            text = review_box.get("1.0", tk.END).strip()
+            if not text:
+                messagebox.showerror("Error", "Write a review")
+                return
+
+            class_id = class_map[selected]
+
+            result = self.db.submit_review(
+                class_id,
+                self.current_user["id"],
+                stars,
+                text
+            )
+
+            messagebox.showinfo("Result", result)
+
+        tk.Button(body, text="Submit Review",
+                command=submit,
+                bg=self.NAV, fg="white").pack(pady=10)
 
     def build_ai_page(self):
         frame = self.pages["AI"]
