@@ -1007,6 +1007,8 @@ class College0App:
         self.public_role_var = None
         self.public_name_entry = None
         self.public_gpa_entry = None
+        self.public_role_widget = None
+        self.public_page_mode = "Dashboard"
         self.configure_styles()
         self.build_shell()
         self.refresh_header_status()
@@ -1163,9 +1165,13 @@ class College0App:
             self.build_dashboard()
             self.show_page("Dashboard", "Dashboard")
         else:
+            self.public_page_mode = "Dashboard"
+            self.build_public_page()
             self.show_page("Public", "Dashboard")
 
     def open_public_application(self, role):
+        self.public_page_mode = role
+        self.build_public_page()
         self.show_page("Public", f"Apply as {role}")
         self.set_public_role(role)
     
@@ -1643,20 +1649,36 @@ class College0App:
             fg=self.TEXT,
             font=("Segoe UI", 10, "bold"),
         ).grid(row=0, column=1, sticky="w", padx=6, pady=6)
+        
+        if self.public_page_mode == "Dashboard":
+            self.public_role_var = tk.StringVar(value="Student")
 
-        self.public_role_var = tk.StringVar(value="Student")
+            self.public_role_widget = ttk.Combobox(
+                form,
+                textvariable=self.public_role_var,
+                values=["Student", "Instructor"],
+                state="readonly",
+                font=("Segoe UI", 10),
+            )
+        else:
+            self.public_role_var = tk.StringVar(value=self.public_page_mode)
 
-        tk.Entry(
-            form,
-            textvariable=self.public_role_var,
-            width=20,
-            relief="solid",
-            bd=1,
-            font=("Segoe UI", 10),
-            state="readonly",
-            readonlybackground=self.CARD,
-            fg=self.TEXT,
-        ).grid(row=1, column=1, padx=6, pady=(0, 10), sticky="we")
+            self.public_role_widget = tk.Entry(
+                form,
+                textvariable=self.public_role_var,
+                width=20,
+                relief="solid",
+                bd=1,
+                font=("Segoe UI", 10),
+                state="readonly",
+                readonlybackground=self.CARD,
+                fg=self.TEXT,
+            )
+
+        self.public_role_widget.grid(
+            row=1, column=1, padx=6, pady=(0, 10), sticky="we"
+        )
+ 
 
         tk.Label(
             form,
