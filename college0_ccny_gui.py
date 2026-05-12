@@ -149,6 +149,17 @@ class College0DB:
             PRIMARY KEY(user_id, event_key)
         )
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        reason TEXT NOT NULL,
+        paid INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )   
+    """)
         self.conn.commit()
 
     def seed_data(self):
@@ -269,8 +280,14 @@ class College0DB:
         if not row:
             return
         suspended = row["suspended"]
-        if row["warnings"] >= 3:
+        if row["warnings"] >= 3 and not suspended:
             suspended = 1
+            self.issue_fine(
+                user_id,
+                500,
+                "Automatic fine: 3 warnings reached = suspension"
+            )
+
         self.conn.execute(
             "UPDATE users SET suspended=? WHERE id=?", (suspended, user_id))
 
@@ -838,6 +855,7 @@ class College0DB:
                 self.issue_warning(
                     row["instructor_id"], f"missing_grades_{row['id']}", 1)
                 messages.append(f"{row['code']} has missing grades.")
+        self.audit_instructor_class_performance()
         return " ".join(messages[:4])
 
     def update_instructor_ratings(self):
@@ -2361,7 +2379,62 @@ class College0App:
         tk.Button(complaint_body, text="Submit Complaint", command=file_instructor_complaint, relief="flat", bg=self.NAV, fg="white",
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(12, 0))
+    
+    def issue_fine(self, user_id, amount, reason):
+        self.conn.excute("""
+            INSERT INTO fines(user_id, amount, reason, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, amount, reason, datetime.now().isoformat()))
+        self.conn.commit()
+    
+    def pay_fine(self, user_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE fines
+            SET paid = 1
+            WHERE user_id = ? AND paid = 0
+        """, (user_id,))
+        self.conn.commit()
+        return "Fine paid successfully."
+   
+    def audit_instructor_class_performance(self):
+        cur = self.conn.cursor()
 
+        cur.execute("""
+            SELECT cl.id AS class_id, cl.instructor_id, c.code
+            FROM classes cl
+            JOIN courses c ON c.id = cl.course_id
+            WHERE cl.cancelled = 0
+        """)
+
+        for row in cur.fetchall():
+            class_id = row["class_id"]
+            instructor_id = row["instructor_id"]
+
+            cur.execute("""
+                SELECT r.grade
+                FROM registrations r
+                Where r.class_id = ? AND r.grade <> ''
+            """, (class_id,))
+
+            grades = cur.fetchall()
+            points = {"A": 4.0, "A-": 3.7, "B+": 3.3, "B": 3.0, "B-": 2.7, "C+": 2.3, "C": 2.0, "D": 1.0, "F":0.0}
+
+            values = [points[g["grade"]] for g in grades if g["grade"] in points]
+
+            if not values:
+                continue
+
+            class_gpa = sum(values) / len(values)
+
+            if class_gpa > 3.5:
+                self.issue_warning(instructor_id, f"grade_inflation_{class_id}", 1)
+
+            elif class_gpa < 2.5:
+                self.issue_warning(instructor_id, f"low_class_performance_{class_id}", 2)
+
+            self.conn.execute("UPDATE users SET suspended=1 WHERE id=?", (instructor_id))
+        self.conn.commit()
 
 if __name__ == "__main__":
     root = tk.Tk()
