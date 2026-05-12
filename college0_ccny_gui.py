@@ -1014,6 +1014,50 @@ class College0App:
         self.refresh_header_status()
         self.open_main_dashboard()
 
+    def show_confetti(self, parent):
+        import random
+
+        canvas = tk.Canvas(parent, bg=self.BG, highlightthickness=0)
+        canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        canvas.update_idletasks()
+
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+
+        pieces = []
+        colors = ["#f0d18d", "#6a4a98", "#a14567", "#2d8c5f", "#bb4f69"]
+
+        for _ in range(50):
+            x = random.randint(0, max(width, 1))
+            y = random.randint(-height, 0)
+            size = random.randint(5, 10)
+            color = random.choice(colors)
+
+            piece = canvas.create_rectangle(
+                x, y, x + size, y + size, fill=color, outline=""
+            )
+            pieces.append((piece, random.randint(3, 7)))
+
+        canvas.create_text(
+            width // 2,
+            height // 2,
+            text="Application Submitted!",
+            fill=self.NAV_DARK,
+            font=("Segoe UI", 22, "bold"),
+        )
+
+        def animate(step=0):
+            for piece, speed in pieces:
+                canvas.move(piece, 0, speed)
+
+            if step < 100:
+                canvas.after(30, lambda: animate(step + 1))
+            else:
+                canvas.destroy()
+
+        animate()
+
     def configure_styles(self):
         style = ttk.Style()
         try:
@@ -1649,7 +1693,7 @@ class College0App:
             fg=self.TEXT,
             font=("Segoe UI", 10, "bold"),
         ).grid(row=0, column=1, sticky="w", padx=6, pady=6)
-        
+
         if self.public_page_mode == "Dashboard":
             self.public_role_var = tk.StringVar(value="Student")
 
@@ -1721,7 +1765,14 @@ class College0App:
                 return
 
             self.db.submit_application(name, role, gpa)
-            messagebox.showinfo("Submitted", "Application submitted successfully.")
+
+            messagebox.showinfo(
+                "Submitted",
+                "Application submitted successfully."
+            )
+
+            self.show_confetti(frame)
+
             self.public_name_entry.delete(0, tk.END)
             self.set_public_role("Student")
 
@@ -1743,115 +1794,7 @@ class College0App:
         ai_card = self.build_ai_panel(frame, None, "Visitor AI Assistant")
         ai_card.pack(fill="both", expand=True, padx=24, pady=(0, 18))
 
-        def submit_app():
-            name = self.public_name_entry.get().strip()
-            role = self.public_role_var.get()
-            try:
-                gpa = float(self.public_gpa_entry.get().strip() or 0)
-            except ValueError:
-                messagebox.showerror("Invalid GPA", "Enter a numeric GPA.")
-                return
-            if not name:
-                messagebox.showerror(
-                    "Missing name", "Please enter the applicant's full name.")
-                return
-            self.db.submit_application(name, role, gpa)
-            messagebox.showinfo(
-                "Submitted", "Application submitted successfully.")
-            self.public_name_entry.delete(0, tk.END)
-            self.set_public_role("Student")
-
-        tk.Button(
-            form,
-            text="Submit Application",
-            command=submit_app,
-            relief="flat",
-            bg=self.GOLD,
-            fg=self.NAV,
-            activebackground="#d8b96d",
-            activeforeground=self.NAV,
-            font=("Segoe UI", 10, "bold"),
-            padx=18,
-            pady=10,
-            cursor="hand2",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=8)
-        ai_card = self.build_ai_panel(frame, None, "Visitor AI Assistant")
-        ai_card.pack(fill="both", expand=True, padx=24, pady=(0, 18))
-        return
-
-        ranking_row = tk.Frame(frame, bg=self.BG)
-        ranking_row.pack(fill="both", expand=False, padx=24, pady=8)
-        top_students, top_classes, low_classes = self.db.public_rankings()
-        groups = [
-            ("Highest GPA Students", [
-             f"{r['full_name']}  •  GPA {r['overall_gpa']}" for r in top_students]),
-            ("Highest Rated Classes", [
-             f"{r['code']} {r['title']}  •  {r['avg_stars']}★" for r in top_classes]),
-            ("Lowest Rated Classes", [
-             f"{r['code']} {r['title']}  •  {r['avg_stars']}★" for r in low_classes]),
-        ]
-        for title, items in groups:
-            card, body = self.make_card(ranking_row, title)
-            card.pack(side="left", fill="both", expand=True, padx=8)
-            lb = self.styled_listbox(body, height=9)
-            lb.pack(fill="both", expand=True)
-            if items:
-                for item in items:
-                    lb.insert(tk.END, item)
-            else:
-                lb.insert(tk.END, "No data available yet")
-
-        app_card, app_body = self.make_card(
-            frame, "Visitor Application", "Apply as a student or instructor using the form below.")
-        app_card.pack(fill="x", padx=24, pady=16)
-        form = tk.Frame(app_body, bg=self.CARD)
-        form.pack(fill="x")
-
-        tk.Label(form, text="Full Name", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        name_entry = tk.Entry(form, width=34, relief="solid",
-                              bd=1, font=("Segoe UI", 10))
-        name_entry.grid(row=1, column=0, padx=6, pady=(0, 10), sticky="w")
-
-        tk.Label(form, text="Apply As", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w", padx=6, pady=6)
-        role_var = tk.StringVar(value="Student")
-        ttk.Combobox(form, textvariable=role_var, values=["Student", "Instructor"], width=20, state="readonly").grid(
-            row=1, column=1, padx=6, pady=(0, 10), sticky="w")
-
-        tk.Label(form, text="GPA", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=0, column=2, sticky="w", padx=6, pady=6)
-        gpa_entry = tk.Entry(form, width=12, relief="solid",
-                             bd=1, font=("Segoe UI", 10))
-        gpa_entry.insert(0, "3.20")
-        gpa_entry.grid(row=1, column=2, padx=6, pady=(0, 10), sticky="w")
-
-        tk.Label(form, text="Student applications use GPA. Instructor applications can leave GPA at 0.00.", bg=self.CARD,
-                 fg=self.MUTED, font=("Segoe UI", 9)).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 10))
-
-        def submit_app():
-            name = name_entry.get().strip()
-            role = role_var.get()
-            try:
-                gpa = float(gpa_entry.get().strip() or 0)
-            except ValueError:
-                messagebox.showerror("Invalid GPA", "Enter a numeric GPA.")
-                return
-            if not name:
-                messagebox.showerror(
-                    "Missing name", "Please enter the applicant's full name.")
-                return
-            self.db.submit_application(name, role, gpa)
-            messagebox.showinfo(
-                "Submitted", "Application submitted successfully.")
-            name_entry.delete(0, tk.END)
-            gpa_entry.delete(0, tk.END)
-            gpa_entry.insert(0, "3.20")
-
-        tk.Button(form, text="Submit Application", command=submit_app, relief="flat", bg=self.GOLD, fg=self.NAV,
-                  activebackground="#c79310", activeforeground=self.NAV, font=("Segoe UI", 10, "bold"),
-                  padx=18, pady=10, cursor="hand2").grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=8)
-
+       
     def build_login_page(self):
         frame = self.pages["Login"]
         self.clear_frame(frame)
