@@ -340,6 +340,45 @@ class College0DB:
         self.refresh_user_status(user_id)
         self.conn.commit()
         return True
+    
+    def issue_fine(self, user_id, amount, reason):
+
+        self.conn.execute("""
+            INSERT INTO fines(user_id, amount, reason, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, amount, reason, datetime.now().isoformat()))
+        self.conn.commit()
+    
+    def pay_fine(self, user_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE fines
+            SET paid = 1
+            WHERE user_id = ? AND paid = 0
+        """, (user_id,))
+        self.conn.commit()
+        return "Fine paid successfully."
+    
+    def get_user_fines(self, user_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, amount, reason, paid, created_at
+            FROM fines
+            WHERE user_id=?
+            ORDER BY paid ASC, id DESC
+        """, (user_id,))
+        return cur.fetchall()  
+
+    def get_all_fines(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT f.id, f.amount, f.reason, f.paid, f.created_at,
+                   u.full_name, u.username
+            FROM fines f
+            JOIN users u ON u.id = f.user_id
+            ORDER BY f.paid ASC, f.id DESC
+        """)
+        return cur.fetchall()
 
     def get_student_quota(self):
         try:
@@ -896,6 +935,49 @@ class College0DB:
                 messages.append(f"{row['code']} has missing grades.")
         self.audit_instructor_class_performance()
         return " ".join(messages[:4])
+    
+    def audit_instructor_class_performance(self):
+        cur = self.conn.cursor()
+
+        cur.execute("""
+            SELECT cl.id AS class_id, cl.instructor_id, c.code
+            FROM classes cl
+            JOIN courses c ON c.id = cl.course_id
+            WHERE cl.cancelled = 0
+        """)
+
+        for row in cur.fetchall():
+            class_id = row["class_id"]
+            instructor_id = row["instructor_id"]
+
+            cur.execute("""
+                SELECT r.grade
+                FROM registrations r
+                Where r.class_id = ? AND r.grade <> ''
+            """, (class_id,))
+
+            grades = cur.fetchall()
+            points = {"A": 4.0, "A-": 3.7, "B+": 3.3, "B": 3.0, "B-": 2.7, "C+": 2.3, "C": 2.0, "D": 1.0, "F":0.0}
+
+            values = [points[g["grade"]] for g in grades if g["grade"] in points]
+
+            if not values:
+                continue
+
+            class_gpa = sum(values) / len(values)
+
+            if class_gpa > 3.5:
+                self.issue_warning(instructor_id, f"grade_inflation_{class_id}", 1)
+
+            elif class_gpa < 2.5:
+                self.issue_warning(instructor_id, f"low_class_performance_{class_id}", 2)
+                
+                self.conn.execute(
+                    "UPDATE users SET suspended=1 WHERE id=?",
+                    (instructor_id,)
+                )
+
+        self.conn.commit()
 
     def update_instructor_ratings(self):
         cur = self.conn.cursor()
@@ -2730,6 +2812,29 @@ class College0App:
         tk.Button(btns, text="Reject Graduation", command=reject_grad, bg=self.DANGER, fg="white",
                   relief="flat", padx=14, pady=8, font=("Segoe UI", 10, "bold")).pack(side="left")
         
+
+
+        fine_card, fine_body = self.make_card(
+            frame,
+            "Student Fines",
+            "View suspension fines and payment status."
+        )
+        fine_card.pack(fill="x", padx=24, pady=(12, 0))
+
+        all_fines = self.db.get_all_fines()
+        fine_list = self.styled_listbox(fine_body, height=6)
+        fine_list.pack(fill="x")
+
+        if all_fines:
+            for f in all_fines:
+                status = "Paid" if f["paid"] else "Unpaid"
+                fine_list.insert(
+                    tk.END,
+                    f"#{f['id']} | {f['full_name']} ({f['username']}) | ${f['amount']} | {status} | {f['reason']}"
+                )
+        else:
+            fine_list.insert(tk.END, "No fines found.")
+
         ai_card = self.build_ai_panel(
             frame, self.current_user, "Registrar Management Assistant")
         ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
@@ -2797,82 +2902,58 @@ class College0App:
             reg_list.insert(
                 tk.END, f"#{r['class_id']}  |  {r['code']} {r['title']}  |  {r['meeting_time']}  |  Grade: {r['grade'] or 'N/A'}")
 
-        bottom = tk.Frame(row, bg=self.BG)
-        bottom.pack(fill="both", expand=True, pady=(16, 0))
-        review_card, review_body = self.make_card(
-            bottom, "Submit Review", "Enter a class ID and add feedback")
-        review_card.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        complaint_card, complaint_body = self.make_card(
-            bottom, "File Complaint", "Report a student or instructor")
-        complaint_card.pack(side="left", fill="both",
-                            expand=True, padx=(10, 0))
+        fine_card, fine_body = self.make_card(
+            row,
+            "My Fines",
+            "Students with 3 warnings must pay a fine to the registrar."
+        )
+        fine_card.pack(fill="x", pady=(16, 0))
 
-        form = tk.Frame(review_body, bg=self.CARD)
-        form.pack(fill="x")
-        tk.Label(form, text="Class ID", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        review_class_id = tk.Entry(
-            form, width=10, relief="solid", bd=1, font=("Segoe UI", 10))
-        review_class_id.grid(row=1, column=0, padx=6, pady=(0, 10), sticky="w")
-        tk.Label(form, text="Stars", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w", padx=6, pady=6)
-        stars_var = tk.StringVar(value="5")
-        ttk.Combobox(form, textvariable=stars_var, values=["1", "2", "3", "4", "5"], width=10, state="readonly").grid(
-            row=1, column=1, padx=6, pady=(0, 10), sticky="w")
-        tk.Label(form, text="Review Text", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=6)
-        review_text = tk.Text(form, width=52, height=8,
-                              relief="solid", bd=1, font=("Segoe UI", 10))
-        review_text.grid(row=3, column=0, columnspan=2,
-                         padx=6, pady=(0, 10), sticky="we")
+        fines = self.db.get_user_fines(self.current_user["id"])
+        fine_list = self.styled_listbox(fine_body, height=5)
+        fine_list.pack(fill="x")
 
-        def submit_review():
-            try:
-                class_id = int(review_class_id.get().strip())
-                stars = int(stars_var.get())
-            except ValueError:
-                messagebox.showerror(
-                    "Invalid", "Enter a valid class ID and stars.")
-                return
-            msg = self.db.submit_review(
-                class_id, self.current_user["id"], stars, review_text.get("1.0", tk.END).strip())
-            messagebox.showinfo("Review", msg)
+        if fines:
+            for f in fines:
+                status = "Paid" if f["paid"] else "Unpaid"
+                fine_list.insert(
+                    tk.END,
+                    f"#{f['id']} | ${f['amount']} | {status} | {f['reason']}"
+                )
+        else:
+            fine_list.insert(tk.END, "No fines found.")
+        
+        def pay_my_fines():
+            msg = self.db.pay_fine(self.current_user["id"])
+            messagebox.showinfo("Fine Payment", msg)
             self.build_dashboard()
 
-        tk.Button(form, text="Submit Review", command=submit_review, relief="flat", bg=self.GOLD, fg=self.NAV,
-                  activebackground="#c79310", activeforeground=self.NAV, font=("Segoe UI", 10, "bold"),
-                  padx=16, pady=8, cursor="hand2").grid(row=4, column=0, columnspan=2, sticky="w", padx=6)
+        tk.Button(
+            fine_body,
+            text="Pay Unpaid Fines",
+            command=pay_my_fines,
+            relief="flat",
+            bg=self.GOLD,
+            fg=self.NAV,
+            font=("Segoe UI", 10, "bold"),
+            padx=16,
+            pady=8,
+            cursor="hand2"
+        ).pack(anchor="w", pady=(10, 0))
 
-        tk.Label(complaint_body, text="Against User", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 6))
-        possible_targets = self.db.get_users_by_role(
-            "Student") + self.db.get_users_by_role("Instructor")
-        target_map = {f"{u['full_name']} ({u['username']})": u["id"]
-                      for u in possible_targets if u["id"] != self.current_user["id"]}
-        target_var = tk.StringVar()
-        ttk.Combobox(complaint_body, textvariable=target_var, values=list(
-            target_map.keys()), width=42, state="readonly").pack(anchor="w", fill="x")
-        tk.Label(complaint_body, text="Complaint Detail", bg=self.CARD, fg=self.TEXT, font=(
-            "Segoe UI", 10, "bold")).pack(anchor="w", pady=(12, 6))
-        complaint_text = tk.Text(
-            complaint_body, width=46, height=8, relief="solid", bd=1, font=("Segoe UI", 10))
-        complaint_text.pack(fill="x")
 
-        def file_complaint():
-            target = target_var.get()
-            detail = complaint_text.get("1.0", tk.END).strip()
-            if not target or not detail:
-                messagebox.showerror(
-                    "Missing info", "Choose a user and enter complaint details.")
-                return
-            self.db.file_complaint(
-                self.current_user["id"], target_map[target], detail)
-            messagebox.showinfo("Complaint", "Complaint submitted.")
-            self.build_dashboard()
+        if self.current_user.get("gpa", 0) >= 3.7:
+            dean_label = tk.Label(
+                row,
+                text="🏆 Dean's List Student",
+                bg="#fff3cd",
+                fg="#7a5c00",
+                font=("Segoe UI", 12, "bold"),
+                padx=18,
+                pady=10
+            )
+            dean_label.pack(fill="x", pady=(14, 0))
 
-        tk.Button(complaint_body, text="Submit Complaint", command=file_complaint, relief="flat", bg=self.NAV, fg="white",
-                  activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
-                  padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(12, 0))
         ai_card = self.build_ai_panel(
             frame, self.current_user, "Student Academic Assistant")
         ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
@@ -3016,61 +3097,8 @@ class College0App:
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(12, 0))
     
-    def issue_fine(self, user_id, amount, reason):
-        self.conn.excute("""
-            INSERT INTO fines(user_id, amount, reason, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (user_id, amount, reason, datetime.now().isoformat()))
-        self.conn.commit()
     
-    def pay_fine(self, user_id):
-        cur = self.conn.cursor()
-        cur.execute("""
-            UPDATE fines
-            SET paid = 1
-            WHERE user_id = ? AND paid = 0
-        """, (user_id,))
-        self.conn.commit()
-        return "Fine paid successfully."
-   
-    def audit_instructor_class_performance(self):
-        cur = self.conn.cursor()
-
-        cur.execute("""
-            SELECT cl.id AS class_id, cl.instructor_id, c.code
-            FROM classes cl
-            JOIN courses c ON c.id = cl.course_id
-            WHERE cl.cancelled = 0
-        """)
-
-        for row in cur.fetchall():
-            class_id = row["class_id"]
-            instructor_id = row["instructor_id"]
-
-            cur.execute("""
-                SELECT r.grade
-                FROM registrations r
-                Where r.class_id = ? AND r.grade <> ''
-            """, (class_id,))
-
-            grades = cur.fetchall()
-            points = {"A": 4.0, "A-": 3.7, "B+": 3.3, "B": 3.0, "B-": 2.7, "C+": 2.3, "C": 2.0, "D": 1.0, "F":0.0}
-
-            values = [points[g["grade"]] for g in grades if g["grade"] in points]
-
-            if not values:
-                continue
-
-            class_gpa = sum(values) / len(values)
-
-            if class_gpa > 3.5:
-                self.issue_warning(instructor_id, f"grade_inflation_{class_id}", 1)
-
-            elif class_gpa < 2.5:
-                self.issue_warning(instructor_id, f"low_class_performance_{class_id}", 2)
-
-            self.conn.execute("UPDATE users SET suspended=1 WHERE id=?", (instructor_id))
-        self.conn.commit()
+    
 
 if __name__ == "__main__":
     root = tk.Tk()
