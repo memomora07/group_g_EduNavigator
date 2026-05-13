@@ -6,11 +6,50 @@ import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
+import re
 
 DB_NAME = "college0.db"
 
 
 class College0DB:
+    AI_ALIASES = {
+        "graduate": "graduation",
+        "graduates": "graduation",
+        "finish": "graduation",
+        "degree": "graduation",
+        "warning": "warnings",
+        "warn": "warnings",
+        "warned": "warnings",
+        "suspend": "suspension",
+        "suspended": "suspension",
+        "ban": "suspension",
+        "register": "registration",
+        "registered": "registration",
+        "enroll": "registration",
+        "enrolled": "registration",
+        "course": "classes",
+        "class": "classes",
+        "professor": "instructor",
+        "teacher": "instructor",
+        "ratings": "rating",
+        "reviews": "review",
+        "complaints": "complaint",
+        "complain": "complaint",
+        "taboos": "taboo",
+        "banned": "taboo",
+        "honours": "honor",
+        "semester": "period",
+        "term": "period",
+    }
+    AI_STOP_WORDS = {
+        "about", "after", "am", "and", "are", "before", "can", "do",
+        "does", "for", "from", "help", "how", "in", "into", "is", "just",
+        "like", "need", "now", "of", "on", "please", "right", "show",
+        "tell", "that", "the", "them", "they", "this", "was", "were",
+        "what", "when", "where", "which", "who", "with", "work", "works",
+        "would", "your",
+    }
+
     def __init__(self, db_name=DB_NAME):
         self.conn = sqlite3.connect(db_name)
         self.conn.row_factory = sqlite3.Row
@@ -929,52 +968,235 @@ class College0DB:
         """, (user_id,))
         return cur.fetchone()
 
+    def normalize_ai_tokens(self, text):
+        tokens = []
+        for raw in re.findall(r"[a-z0-9']+", text.lower()):
+            token = self.AI_ALIASES.get(raw, raw)
+            if token in self.AI_STOP_WORDS:
+                continue
+            if len(token) <= 2 and token not in {"ai", "cs", "gpa"}:
+                continue
+            tokens.append(token)
+        return tokens
+
     def build_local_knowledge(self, user=None):
-        facts = [
-            f"Current semester period: {self.get_current_period()}",
-            f"Student quota: {self.get_student_quota()} active students",
-            "Students normally need GPA above 3.0 and open quota for admission.",
-            "Registration is only open during Registration or Special Registration.",
-            "Reviews are only allowed by enrolled students before grades are posted.",
+        facts = []
+
+        def add_fact(text, *keywords):
+            manual_keywords = {
+                self.AI_ALIASES.get(keyword.lower(), keyword.lower())
+                for keyword in keywords
+            }
+            facts.append({
+                "text": text,
+                "priority_keywords": manual_keywords,
+                "keywords": manual_keywords | set(self.normalize_ai_tokens(text)),
+            })
+
+        current_period = self.get_current_period()
+        quota = self.get_student_quota()
+        active_students = self.get_active_student_count()
+        required_courses = [
+            row["code"] for row in self.conn.execute(
+                "SELECT code FROM courses WHERE required=1 ORDER BY code"
+            ).fetchall()
         ]
+        taboo_words = self.get_taboo_words()
+        available_classes = self.get_available_classes()
+        complaints = self.get_complaints()
+
+        instructor_rows = self.conn.execute("""
+        SELECT u.full_name, ROUND(COALESCE(ip.avg_rating, 0), 2) AS avg_rating
+        FROM instructor_profiles ip
+        JOIN users u ON u.id = ip.user_id
+        ORDER BY u.full_name
+        """).fetchall()
+
+        add_fact(
+            f"Current semester period: {current_period}. Registration actions are only allowed during Registration or Special Registration.",
+            "period", "registration", "semester", "current"
+        )
+        add_fact(
+            f"Student admission quota: {active_students} active students out of {quota}. Student applicants normally need GPA above 3.0 and open quota for admission.",
+            "admission", "quota", "student", "gpa", "rules"
+        )
+        add_fact(
+            f"Graduation rules: a student needs 8 completed classes and all required courses passed: {', '.join(required_courses)}. Applying too early is automatically rejected and gives 1 warning.",
+            "graduation", "requirements", "required", "graduate", "finish", "degree"
+        )
+        add_fact(
+            "Warning and suspension rules: 3 warnings trigger suspension and a $500 fine. GPA below 2.0 after grading also suspends a student. GPA from 2.0 to 2.25 gives a warning. Failing the same course twice suspends the student.",
+            "warnings", "suspension", "gpa", "fine", "failed", "rules"
+        )
+        add_fact(
+            "Registration limits: students can register only during Registration or Special Registration, may take at most 4 courses, cannot register while suspended, cannot keep time-conflicting classes, and full classes move students to the wait-list.",
+            "registration", "limits", "waitlist", "conflict", "suspended"
+        )
+        add_fact(
+            f"Taboo words policy: the current blocked words are {', '.join(taboo_words)}. Reviews with 1 or 2 taboo words are masked and give 1 warning. Reviews with 3 or more taboo words are hidden and give 2 warnings.",
+            "taboo", "policy", "review", "warnings", "blocked", "words"
+        )
+        add_fact(
+            "Honor roll rules: a GPA above 3.75 marks the student as honor roll. If an honor-roll student still has warnings, the system removes one warning once.",
+            "honor", "honor_roll", "gpa", "warnings", "rules"
+        )
+        add_fact(
+            f"Complaint rules: students can file complaints against other students or instructors, instructors can file complaints against students in their class, and the registrar resolves complaints by warning either the accused or the filer. There are currently {len(complaints)} complaint records.",
+            "complaint", "rules", "registrar", "student", "instructor", "warning"
+        )
+        add_fact(
+            f"Current available classes: {len(available_classes)} active classes are listed this period.",
+            "classes", "available", "current", "catalog", "offerings"
+        )
+        for row in available_classes:
+            open_seats = max(row["capacity"] - row["enrolled"], 0)
+            add_fact(
+                f"Available class: {row['code']} {row['title']} with {row['instructor'] or 'TBA'} at {row['meeting_time']}. Seats filled: {row['enrolled']}/{row['capacity']} with {open_seats} open.",
+                "classes", "available", "current", row["code"], row["title"], row["instructor"] or "tba"
+            )
+        if instructor_rows:
+            ratings_summary = ", ".join(
+                f"{row['full_name']} {row['avg_rating']:.2f}" for row in instructor_rows
+            )
+            add_fact(
+                f"Instructor ratings: {ratings_summary}. Instructors with an average rating below 2.0 receive a warning.",
+                "instructor", "rating", "review", "teaching"
+            )
+
         top_students, top_classes, low_classes = self.public_rankings()
         for row in top_students[:3]:
-            facts.append(
-                f"Top GPA student: {row['full_name']} with GPA {row['overall_gpa']}")
+            add_fact(
+                f"Top GPA student: {row['full_name']} with GPA {row['overall_gpa']}.",
+                "gpa", "honor", "student", "top"
+            )
         for row in top_classes[:2]:
-            facts.append(
-                f"Highly rated class: {row['code']} {row['title']} rated {row['avg_stars']}")
+            add_fact(
+                f"Highly rated class: {row['code']} {row['title']} rated {row['avg_stars']}.",
+                "classes", "rating", "review", row["code"], row["title"]
+            )
+        for row in low_classes[:2]:
+            add_fact(
+                f"Low rated class: {row['code']} {row['title']} rated {row['avg_stars']}.",
+                "classes", "rating", "review", row["code"], row["title"], "low"
+            )
+
         if user and user["role"] == "Student":
+            summary = self.get_user_summary(user["id"])
+            if summary:
+                add_fact(
+                    f"Student status: {summary['full_name']} currently has {summary['warnings']} warnings, suspended status {bool(summary['suspended'])}, and GPA {summary['overall_gpa'] or 0}.",
+                    "student", "warnings", "suspension", "gpa", "status", "my"
+                )
+            registrations = self.get_student_registrations(user["id"])
+            if registrations:
+                joined = "; ".join(
+                    f"{row['code']} {row['title']} at {row['meeting_time']} grade {row['grade'] or 'not posted'}"
+                    for row in registrations
+                )
+                add_fact(
+                    f"Student schedule: you are currently taking {len(registrations)} classes: {joined}.",
+                    "student", "classes", "taking", "schedule", "my", "registration"
+                )
             for row in self.get_student_registrations(user["id"]):
-                facts.append(
-                    f"Student class: {row['code']} {row['title']} at {row['meeting_time']} grade {row['grade'] or 'not posted'}")
+                add_fact(
+                    f"Student class: {row['code']} {row['title']} at {row['meeting_time']} grade {row['grade'] or 'not posted'}.",
+                    "student", "classes", "taking", row["code"], row["title"], "grade"
+                )
+            else:
+                add_fact(
+                    "Student schedule: you are not currently registered for any classes.",
+                    "student", "classes", "taking", "schedule", "my", "registration"
+                )
         if user and user["role"] == "Instructor":
-            for row in self.get_instructor_classes(user["id"]):
-                facts.append(
-                    f"Instructor teaches {row['code']} {row['title']} at {row['meeting_time']}")
+            summary = self.get_user_summary(user["id"])
+            if summary:
+                add_fact(
+                    f"Instructor status: {summary['full_name']} currently has average rating {summary['avg_rating'] or 0} and suspended status {bool(summary['suspended'])}.",
+                    "instructor", "rating", "status", "teaching"
+                )
+            classes = self.get_instructor_classes(user["id"])
+            if classes:
+                joined = "; ".join(
+                    f"{row['code']} {row['title']} at {row['meeting_time']}"
+                    for row in classes
+                )
+                add_fact(
+                    f"Instructor teaching schedule: you currently teach {len(classes)} classes: {joined}.",
+                    "instructor", "classes", "teach", "teaching", "schedule", "my"
+                )
+            for row in classes:
+                add_fact(
+                    f"Instructor teaches {row['code']} {row['title']} at {row['meeting_time']}.",
+                    "instructor", "classes", "teach", row["code"], row["title"]
+                )
+                students = self.get_students_in_class(row["id"])
+                if students:
+                    roster = "; ".join(
+                        f"{student['full_name']} ({student['username']}) warnings {student['warnings']} GPA {student['overall_gpa'] or 0} grade {student['grade'] or 'not posted'}"
+                        for student in students
+                    )
+                    add_fact(
+                        f"Instructor student roster for {row['code']} {row['title']}: {len(students)} students enrolled. {roster}.",
+                        "instructor", "students", "student", "roster", row["code"], row["title"], "class"
+                    )
+                else:
+                    add_fact(
+                        f"Instructor student roster for {row['code']} {row['title']}: there are no enrolled students right now.",
+                        "instructor", "students", "student", "roster", row["code"], row["title"], "class"
+                    )
+            if not classes:
+                add_fact(
+                    "Instructor teaching schedule: you do not currently have any assigned classes.",
+                    "instructor", "classes", "teach", "teaching", "schedule", "my"
+                )
+        if user and user["role"] == "Registrar":
+            pending_grads = len([
+                row for row in self.get_graduation_applications()
+                if row["status"] == "Pending"
+            ])
+            add_fact(
+                f"Registrar management summary: there are {pending_grads} pending graduation applications and {len(complaints)} complaint records to review.",
+                "registrar", "graduation", "complaint", "management", "pending"
+            )
         return facts
 
     def answer_question(self, question, user=None):
         question_lower = question.lower().strip()
         if not question_lower:
-            return "Ask about admissions, registration periods, classes, GPA rules, or your current records."
+            return {
+                "answer": "Ask about admissions, registration periods, graduation rules, classes, taboo words, complaints, or your current records.",
+                "used_external": False,
+            }
         facts = self.build_local_knowledge(user)
         scored = []
-        tokens = [token for token in question_lower.replace(
-            "?", " ").split() if len(token) > 2]
+        tokens = self.normalize_ai_tokens(question_lower)
+        token_set = set(tokens)
         for fact in facts:
-            fact_lower = fact.lower()
-            score = sum(1 for token in tokens if token in fact_lower)
-            if score:
-                scored.append((score, fact))
+            priority_overlap = token_set & fact["priority_keywords"]
+            secondary_overlap = token_set & (
+                fact["keywords"] - fact["priority_keywords"]
+            )
+            score = (len(priority_overlap) * 5) + (len(secondary_overlap) * 2)
+            if score > 0:
+                scored.append((score, fact["text"]))
         scored.sort(reverse=True)
         if scored:
-            best = [fact for _, fact in scored[:3]]
-            return "Local college info:\n- " + "\n- ".join(best)
-        return (
-            "No strong match was found in the local college knowledge store. "
-            "In the full project this would be the point to send the question to an LLM, with a hallucination warning."
-        )
+            best_score = scored[0][0]
+            best = [
+                fact for score, fact in scored[:4]
+                if score >= max(5, best_score - 3)
+            ]
+            return {
+                "answer": "Local college info:\n- " + "\n- ".join(best),
+                "used_external": False,
+            }
+        return {
+            "answer": (
+                "No strong local match was found in the College0 knowledge store.\n\n"
+                "In the full project, this question would be sent to an external LLM for a possible answer."
+            ),
+            "used_external": True,
+        }
 
 
 class College0App:
@@ -993,6 +1215,9 @@ class College0App:
     BORDER = "#ddd4ea"
     SUCCESS = "#2d8c5f"
     DANGER = "#bb4f69"
+    WARNING_BG = "#fff1a8"
+    WARNING_BORDER = "#d7b83f"
+    WARNING_TEXT = "#5f4a00"
 
     def __init__(self, root):
         self.root = root
@@ -1376,16 +1601,17 @@ class College0App:
         
         wrapper = tk.Frame(frame, bg=self.BG)
         wrapper.pack(fill="both", expand=True, padx=24, pady=24)
+        ai_title = self.get_ai_panel_title(self.current_user)
         
         self.section_title(
             wrapper,
-            "College0 AI Assistant",
+            ai_title,
             "Ask questions about registrations, GPA, classes, reviews, warnings, and semester rules."
             )
         ai_card = self.build_ai_panel(
             wrapper,
             self.current_user,
-            "AI College Assistant"
+            ai_title
             )
         
         ai_card.pack(fill="both", expand=True, pady=(20, 0))
@@ -1436,28 +1662,302 @@ class College0App:
             tk.Label(parent, text=subtitle, bg=self.BG, fg=self.MUTED,
                      font=("Segoe UI", 11)).pack(anchor="w", pady=(6, 0))
 
+    def get_ai_panel_title(self, user=None):
+        if not user:
+            return "Visitor AI Assistant"
+        return {
+            "Student": "Student Academic Assistant",
+            "Instructor": "Instructor Teaching Assistant",
+            "Registrar": "Registrar Management Assistant",
+        }.get(user["role"], "College0 AI Assistant")
+
+    def get_ai_suggestions(self, user=None):
+        if not user:
+            return [
+                "What classes are available right now?",
+                "What is the current semester period?",
+                "What are graduation requirements?",
+            ]
+        if user["role"] == "Student":
+            return [
+                "What classes am I taking?",
+                "What is the current semester period?",
+                "What are graduation requirements?",
+            ]
+        if user["role"] == "Instructor":
+            return [
+                "Which classes do I teach?",
+                "Which students are in my classes?",
+                "How do instructor ratings work?",
+            ]
+        if user["role"] == "Registrar":
+            return [
+                "What are graduation requirements?",
+                "What are the complaint rules?",
+                "What taboo words are blocked?",
+            ]
+        return [
+            "What classes are available right now?",
+            "What is the current semester period?",
+            "What are graduation requirements?",
+        ]
+
+    def get_ai_role_hint(self, user=None):
+        if not user:
+            return "Visitors can ask general questions about current classes, semester periods, and college requirements."
+        if user["role"] == "Student":
+            return "Students can ask about their own schedule, graduation rules, warnings, registration limits, and local college policies."
+        if user["role"] == "Instructor":
+            return "Instructors can ask about classes they teach and the students enrolled in those classes."
+        if user["role"] == "Registrar":
+            return "Registrars can ask about complaints, taboo words, graduation reviews, and management rules."
+        return "Ask about the local college system and role-specific records."
+
+    def get_ai_followups(self, user=None, question_text="", answer_text="", used_external=False):
+        if used_external:
+            return self.get_ai_suggestions(user)
+
+        prompts = []
+        tokens = set(self.db.normalize_ai_tokens(f"{question_text} {answer_text}"))
+
+        if "graduation" in tokens:
+            prompts.extend([
+                "What are the required courses?",
+                "How many completed classes are needed for graduation?",
+            ])
+            if user and user["role"] == "Student":
+                prompts.append("Can I apply for graduation now?")
+        if "registration" in tokens or "classes" in tokens:
+            prompts.append("What is the current semester period?")
+            if user and user["role"] == "Student":
+                prompts.append("What classes am I taking?")
+            else:
+                prompts.append("What classes are available right now?")
+        if "warnings" in tokens or "suspension" in tokens:
+            prompts.extend([
+                "What is the taboo words policy?",
+                "What are the complaint rules?",
+            ])
+        if "taboo" in tokens:
+            prompts.extend([
+                "How many warnings do taboo words cause?",
+                "What are the complaint rules?",
+            ])
+        if "complaint" in tokens:
+            prompts.extend([
+                "How do warning and suspension rules work?",
+                "What taboo words are blocked?",
+            ])
+        if "instructor" in tokens or "students" in tokens:
+            prompts.extend([
+                "Which classes do I teach?",
+                "Which students are in my classes?",
+            ])
+        if "period" in tokens:
+            prompts.extend([
+                "What classes are available right now?",
+                "What are registration limits?",
+            ])
+
+        if not prompts:
+            prompts = self.get_ai_suggestions(user)
+
+        deduped = []
+        for prompt in prompts:
+            if prompt not in deduped:
+                deduped.append(prompt)
+        return deduped[:3]
+
     def build_ai_panel(self, parent, user=None, title="College0 AI Assistant"):
         card, body = self.make_card(
             parent,
             title,
             "Answers come from the local College0 knowledge store first. If nothing matches, the app warns that an external LLM answer could hallucinate.",
         )
+        role_hint = tk.Label(
+            body,
+            text=self.get_ai_role_hint(user),
+            bg=self.CARD_ALT,
+            fg=self.TEXT,
+            font=("Segoe UI", 10),
+            justify="left",
+            anchor="w",
+            padx=12,
+            pady=10,
+            wraplength=780,
+        )
+        role_hint.pack(fill="x", pady=(0, 10))
+
+        warning_box = tk.Frame(body, bg=self.WARNING_BORDER)
+        tk.Label(
+            warning_box,
+            text="External AI response may contain hallucinations.",
+            bg=self.WARNING_BG,
+            fg=self.WARNING_TEXT,
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=8,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=1, pady=1)
+        warning_box.pack(fill="x", pady=(0, 10))
+        warning_box.pack_forget()
+
+        source_label = tk.Label(
+            body,
+            text="Current answer source: local College0 knowledge store is ready.",
+            bg=self.CARD,
+            fg=self.MUTED,
+            font=("Segoe UI", 9),
+        )
+        source_label.pack(anchor="w", pady=(0, 8))
+
+        status_label = tk.Label(
+            body,
+            text="Ready for a question. Press Ctrl+Enter to ask.",
+            bg=self.CARD,
+            fg=self.NAV_DARK,
+            font=("Segoe UI", 9, "bold"),
+        )
+        status_label.pack(anchor="w", pady=(0, 10))
+
+        suggestions = tk.Frame(body, bg=self.CARD)
+        suggestions.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            suggestions,
+            text="Try a demo question",
+            bg=self.CARD,
+            fg=self.TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 6))
+
         question = tk.Text(body, height=4, relief="solid",
                            bd=1, font=("Segoe UI", 10))
         question.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            body,
+            text="Type your own question or use a suggestion button. Ctrl+Enter submits the question.",
+            bg=self.CARD,
+            fg=self.MUTED,
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 8))
         answer = tk.Text(body, height=8, relief="solid", bd=1,
                          font=("Segoe UI", 10), wrap="word")
         answer.pack(fill="both", expand=True)
+        answer.insert("1.0", "Answers will appear here. The AI checks local college knowledge first.")
+        answer.config(state="disabled")
+
+        followup_wrap = tk.Frame(body, bg=self.CARD)
+        followup_wrap.pack(fill="x", pady=(10, 0))
+        tk.Label(
+            followup_wrap,
+            text="Suggested follow-up questions",
+            bg=self.CARD,
+            fg=self.TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 6))
+        followup_row = tk.Frame(followup_wrap, bg=self.CARD)
+        followup_row.pack(anchor="w", fill="x")
+
+        button_row = tk.Frame(suggestions, bg=self.CARD)
+        button_row.pack(anchor="w", fill="x")
+
+        def fill_question(prompt):
+            question.delete("1.0", tk.END)
+            question.insert("1.0", prompt)
+            question.focus_set()
+
+        def set_answer(text):
+            answer.config(state="normal")
+            answer.delete("1.0", tk.END)
+            answer.insert("1.0", text)
+            answer.config(state="disabled")
+
+        def render_followups(prompts):
+            for widget in followup_row.winfo_children():
+                widget.destroy()
+            for prompt in prompts:
+                tk.Button(
+                    followup_row,
+                    text=prompt,
+                    command=lambda value=prompt: fill_question(value),
+                    relief="flat",
+                    bg=self.CARD_ALT,
+                    fg=self.NAV_DARK,
+                    activebackground="#efe7fb",
+                    activeforeground=self.NAV_DARK,
+                    font=("Segoe UI", 9, "bold"),
+                    padx=10,
+                    pady=6,
+                    cursor="hand2",
+                ).pack(side="left", padx=(0, 8), pady=(0, 4))
+
+        for prompt in self.get_ai_suggestions(user):
+            tk.Button(
+                button_row,
+                text=prompt,
+                command=lambda value=prompt: fill_question(value),
+                relief="flat",
+                bg=self.CARD_ALT,
+                fg=self.NAV_DARK,
+                activebackground="#efe7fb",
+                activeforeground=self.NAV_DARK,
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=6,
+                cursor="hand2",
+            ).pack(side="left", padx=(0, 8), pady=(0, 4))
+        render_followups(self.get_ai_suggestions(user))
 
         def ask_ai():
-            response = self.db.answer_question(
-                question.get("1.0", tk.END).strip(), user)
-            answer.delete("1.0", tk.END)
-            answer.insert("1.0", response)
+            question_text = question.get("1.0", tk.END).strip()
+            status_label.config(text="Searching the local college knowledge store...")
+            response = self.db.answer_question(question_text, user)
+            set_answer(response["answer"])
+            if response["used_external"]:
+                warning_box.pack(fill="x", pady=(0, 10), before=source_label)
+                source_label.config(
+                    text="Current answer source: external fallback placeholder. Keep the hallucination warning in mind.",
+                    fg=self.WARNING_TEXT,
+                )
+                status_label.config(text="No strong local match found. External fallback would be used here.")
+            else:
+                warning_box.pack_forget()
+                source_label.config(
+                    text="Current answer source: local College0 knowledge store.",
+                    fg=self.MUTED,
+                )
+                status_label.config(text="Local answer found from the college knowledge store.")
+            render_followups(
+                self.get_ai_followups(
+                    user,
+                    question_text,
+                    response["answer"],
+                    response["used_external"],
+                )
+            )
 
-        tk.Button(body, text="Ask AI", command=ask_ai, relief="flat", bg=self.NAV, fg="white",
+        def clear_ai():
+            question.delete("1.0", tk.END)
+            set_answer("Answers will appear here. The AI checks local college knowledge first.")
+            warning_box.pack_forget()
+            source_label.config(
+                text="Current answer source: local College0 knowledge store is ready.",
+                fg=self.MUTED,
+            )
+            status_label.config(text="Ready for a question. Press Ctrl+Enter to ask.")
+            render_followups(self.get_ai_suggestions(user))
+
+        question.bind("<Control-Return>", lambda event: (ask_ai(), "break")[1])
+
+        action_row = tk.Frame(body, bg=self.CARD)
+        action_row.pack(anchor="w", pady=(10, 0))
+        tk.Button(action_row, text="Ask AI", command=ask_ai, relief="flat", bg=self.NAV, fg="white",
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
-                  padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(10, 0))
+                  padx=16, pady=8, cursor="hand2").pack(side="left")
+        tk.Button(action_row, text="Clear", command=clear_ai, relief="flat", bg=self.CARD_ALT, fg=self.NAV_DARK,
+                  activebackground="#efe7fb", activeforeground=self.NAV_DARK, font=("Segoe UI", 10, "bold"),
+                  padx=16, pady=8, cursor="hand2").pack(side="left", padx=(8, 0))
         return card
 
     def make_feature_card(self, parent, badge, title, items, extra_items=None):
@@ -2231,7 +2731,7 @@ class College0App:
                   relief="flat", padx=14, pady=8, font=("Segoe UI", 10, "bold")).pack(side="left")
         
         ai_card = self.build_ai_panel(
-            frame, self.current_user, "Registrar AI Assistant")
+            frame, self.current_user, "Registrar Management Assistant")
         ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
 
     def build_student_dashboard(self, frame):
@@ -2374,7 +2874,7 @@ class College0App:
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(12, 0))
         ai_card = self.build_ai_panel(
-            frame, self.current_user, "Student AI Assistant")
+            frame, self.current_user, "Student Academic Assistant")
         ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
 
     def build_instructor_dashboard(self, frame):
@@ -2464,7 +2964,7 @@ class College0App:
         complaint_card.pack(side="left", fill="both",
                             expand=True, padx=(0, 10))
         ai_card = self.build_ai_panel(
-            extra, self.current_user, "Instructor AI Assistant")
+            extra, self.current_user, "Instructor Teaching Assistant")
         ai_card.pack(side="left", fill="both", expand=True, padx=(10, 0))
 
         tk.Label(complaint_body, text="Student in Selected Class", bg=self.CARD,
