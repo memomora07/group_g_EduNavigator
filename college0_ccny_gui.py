@@ -67,9 +67,17 @@ class College0DB:
             full_name TEXT NOT NULL,
             must_change_password INTEGER DEFAULT 0,
             warnings INTEGER DEFAULT 0,
-            suspended INTEGER DEFAULT 0
+            suspended INTEGER DEFAULT 0,
+            graduated INTEGER DEFAULT 0
         )
         """)
+        # Migration: add `graduated` column for legacy databases that
+        # were created before this column existed. SQLite doesn't support
+        # ADD COLUMN IF NOT EXISTS, so guard the ALTER.
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN graduated INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS student_profiles (
             user_id INTEGER PRIMARY KEY,
@@ -383,12 +391,48 @@ class College0DB:
     def pay_fine(self, user_id):
         cur = self.conn.cursor()
         cur.execute("""
+            SELECT role, warnings, suspended
+            FROM users
+            WHERE id = ?
+        """, (user_id,))
+        user_row = cur.fetchone()
+        if not user_row:
+            return "User not found."
+
+        cur.execute("""
             UPDATE fines
             SET paid = 1
             WHERE user_id = ? AND paid = 0
         """, (user_id,))
+        paid_count = cur.rowcount
+
+        cur.execute("""
+            SELECT COUNT(*) AS cnt
+            FROM fines
+            WHERE user_id = ? AND reason = ? AND paid = 1
+        """, (user_id, "Automatic fine: 3 warnings reached = suspension"))
+        has_paid_suspension_fine = cur.fetchone()["cnt"] > 0
+
+        restored_status = False
+        if user_row["role"] == "Student" and has_paid_suspension_fine and (
+            user_row["suspended"] or user_row["warnings"] >= 3
+        ):
+            self.conn.execute("""
+            UPDATE users
+            SET suspended = 0,
+                warnings = CASE WHEN warnings >= 3 THEN 2 ELSE warnings END
+            WHERE id = ?
+        """, (user_id,))
+            restored_status = True
+
         self.conn.commit()
-        return "Fine paid successfully."
+        if paid_count > 0 and restored_status:
+            return "Fine paid successfully. Student status restored to active."
+        if paid_count > 0:
+            return "Fine paid successfully."
+        if restored_status:
+            return "Paid suspension fine found. Student status restored to active."
+        return "No unpaid fines found."
 
     def get_user_fines(self, user_id):
         cur = self.conn.cursor()
@@ -448,6 +492,23 @@ class College0DB:
             audit_message = self.run_grading_period_audit()
             if audit_message:
                 message_parts.append(audit_message)
+
+        # When the system enters Special Registration, give students the
+        # widest possible set of options by reopening any cancelled classes.
+        # Instructor warnings / suspensions from the audit are NOT rolled
+        # back — only the class availability is restored so affected
+        # students can pick those classes again.
+        reopened_count = 0
+        if requested_period == "Special Registration":
+            cur = self.conn.cursor()
+            cur.execute("SELECT COUNT(*) AS c FROM classes WHERE cancelled=1")
+            reopened_count = cur.fetchone()["c"]
+            if reopened_count:
+                self.conn.execute("UPDATE classes SET cancelled=0 WHERE cancelled=1")
+                message_parts.append(
+                    f"{reopened_count} previously cancelled class(es) were reopened for the Special Registration window."
+                )
+
         self.set_setting("current_period", requested_period)
         self.conn.execute(
             "UPDATE classes SET period_state=? WHERE cancelled=0", (requested_period,))
@@ -505,20 +566,45 @@ class College0DB:
         cur = self.conn.cursor()
         cur.execute("""
         SELECT cl.id, c.code, c.title, cl.meeting_time, cl.capacity, cl.instructor_id,
+               cl.cancelled,
                u.full_name AS instructor
         FROM classes cl
         JOIN courses c ON c.id = cl.course_id
         LEFT JOIN users u ON u.id = cl.instructor_id
-        ORDER BY c.code
+        ORDER BY cl.cancelled, c.code
         """)
         return cur.fetchall()
+
+    def reactivate_class(self, class_id):
+        """Bring a cancelled class back online. Only the registrar may do
+        this, and only during the Setup period — that's when the class
+        catalog is being prepared for a fresh semester."""
+        if self.get_current_period() != "Setup":
+            return "Classes can only be reactivated during the Setup period."
+        cur = self.conn.cursor()
+        cur.execute("SELECT cancelled FROM classes WHERE id=?", (class_id,))
+        row = cur.fetchone()
+        if not row:
+            return "Class not found."
+        if not row["cancelled"]:
+            return "That class is already active."
+        self.conn.execute(
+            "UPDATE classes SET cancelled=0, period_state='Setup' WHERE id=?",
+            (class_id,),
+        )
+        self.conn.commit()
+        return "Class reactivated and ready for registration."
 
     def update_class_setup(self, class_id, instructor_id, meeting_time, capacity):
         if self.get_current_period() != "Setup":
             return "Class setup is only editable during the Setup period."
+        if not meeting_time.strip():
+            return "Meeting time cannot be empty."
+        if capacity <= 0:
+            return "Capacity must be greater than 0."
         self.conn.execute(
             "UPDATE classes SET instructor_id=?, meeting_time=?, capacity=?, period_state='Setup' WHERE id=?",
-            (instructor_id, meeting_time, capacity, class_id),
+            (instructor_id, meeting_time.strip(), capacity, class_id),
         )
         self.conn.commit()
         return "Class setup updated."
@@ -594,6 +680,14 @@ class College0DB:
         """, (student_id,))
         return cur.fetchall()
 
+    def get_student_registration_count(self, student_id):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM registrations WHERE student_id=?",
+            (student_id,),
+        )
+        return cur.fetchone()["cnt"]
+
     def register_student(self, student_id, class_id):
         cur = self.conn.cursor()
         current_period = self.get_current_period()
@@ -607,6 +701,18 @@ class College0DB:
         status_row = cur.fetchone()
         if status_row and status_row["suspended"]:
             return "Suspended students cannot register for classes."
+        # Spec: "A student can retake the same class if s/he got an F before."
+        # If a prior F record exists for the same (class_id, student_id), clear
+        # it so the UNIQUE constraint does not block a legitimate retake.
+        cur.execute(
+            "SELECT id, grade FROM registrations WHERE class_id=? AND student_id=?",
+            (class_id, student_id),
+        )
+        existing = cur.fetchone()
+        retake_note = ""
+        if existing and existing["grade"] == "F":
+            cur.execute("DELETE FROM registrations WHERE id=?", (existing["id"],))
+            retake_note = " (Retake of a previously failed class.)"
         cur.execute("""
         SELECT cl.meeting_time
         FROM registrations r
@@ -636,7 +742,10 @@ class College0DB:
             cur.execute(
                 "INSERT INTO registrations(class_id, student_id) VALUES (?, ?)", (class_id, student_id))
             self.conn.commit()
-            return "Registration successful."
+            total_registrations = self.get_student_registration_count(student_id)
+            if total_registrations == 1:
+                return "Registration successful." + retake_note + " Alert: students should stay enrolled in at least 2 classes."
+            return "Registration successful." + retake_note
         except sqlite3.IntegrityError:
             return "Already registered for this class."
 
@@ -658,30 +767,24 @@ class College0DB:
 
         cur.execute("DELETE FROM registrations WHERE id=?", (registration["id"],))
 
+        # Per spec ("wait-list that only the course instructor can let in"),
+        # do NOT auto-admit the next wait-listed student here. The instructor
+        # must explicitly admit a wait-listed student via the dashboard.
         waitlist_note = ""
-        cur.execute("""
-            SELECT w.id, w.student_id, u.suspended
-            FROM waitlist w
-            JOIN users u ON u.id = w.student_id
-            WHERE w.class_id=?
-            ORDER BY w.created_at, w.id
-        """, (class_id,))
-        for waiter in cur.fetchall():
-            cur.execute("DELETE FROM waitlist WHERE id=?", (waiter["id"],))
-            if waiter["suspended"]:
-                continue
-            try:
-                cur.execute(
-                    "INSERT INTO registrations(class_id, student_id) VALUES (?, ?)",
-                    (class_id, waiter["student_id"]),
-                )
-                waitlist_note = " The next wait-listed student was admitted automatically."
-                break
-            except sqlite3.IntegrityError:
-                continue
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM waitlist WHERE class_id=?",
+            (class_id,),
+        )
+        waiting = cur.fetchone()["cnt"]
+        if waiting:
+            waitlist_note = f" A seat is now open; {waiting} student(s) are waiting and the instructor can admit one."
 
         self.conn.commit()
-        return "Unenrolled successfully." + waitlist_note
+        total_registrations = self.get_student_registration_count(student_id)
+        alert_note = ""
+        if total_registrations == 1:
+            alert_note = " Alert: students should stay enrolled in at least 2 classes."
+        return "Unenrolled successfully." + waitlist_note + alert_note
 
     def get_instructor_classes(self, instructor_id):
         cur = self.conn.cursor()
@@ -728,6 +831,10 @@ class College0DB:
         return cur.fetchall()
 
     def admit_waitlisted_student(self, wait_id, class_id):
+        """Instructor admits a wait-listed student. Per spec, the instructor
+        is the only path off the wait-list, and this is an explicit override:
+        the instructor may admit even when the class is already at capacity
+        (the class total increases accordingly)."""
         if self.get_current_period() not in {"Registration", "Special Registration"}:
             return "Wait-list admissions are only available during Registration or Special Registration."
         cur = self.conn.cursor()
@@ -745,13 +852,23 @@ class College0DB:
         capacity = cur.fetchone()["capacity"]
         cur.execute(
             "SELECT COUNT(*) AS cnt FROM registrations WHERE class_id=?", (class_id,))
-        if cur.fetchone()["cnt"] >= capacity:
-            return "Class is still full."
-        cur.execute("INSERT INTO registrations(class_id, student_id) VALUES (?, ?)",
-                    (class_id, row["student_id"]))
+        enrolled = cur.fetchone()["cnt"]
+        try:
+            cur.execute(
+                "INSERT INTO registrations(class_id, student_id) VALUES (?, ?)",
+                (class_id, row["student_id"]),
+            )
+        except sqlite3.IntegrityError:
+            return "That student is already enrolled in the class."
         cur.execute("DELETE FROM waitlist WHERE id=?", (wait_id,))
         self.conn.commit()
-        return "Wait-listed student admitted."
+        new_total = enrolled + 1
+        if enrolled >= capacity:
+            return (
+                f"Wait-listed student admitted via instructor override. "
+                f"Class is now over capacity ({new_total}/{capacity})."
+            )
+        return f"Wait-listed student admitted. Class is now {new_total}/{capacity}."
 
     def get_taboo_words(self):
         cur = self.conn.cursor()
@@ -804,6 +921,10 @@ class College0DB:
             if warning_count:
                 self.issue_warning(student_id, warning_key, warning_count)
             self.update_instructor_ratings()
+            if warning_count == 1:
+                return "Review submitted. Alert: taboo words were detected and you received 1 warning."
+            if warning_count == 2:
+                return "Review submitted. Alert: repeated taboo words were detected, your review was hidden, and you received 2 warnings."
             return "Review submitted."
         except sqlite3.IntegrityError:
             return "You already reviewed this class."
@@ -899,12 +1020,17 @@ class College0DB:
         """, (status, final_note, grad_id))
 
         if approve:
+            # Spec: graduating student "leaves the system with a Bachelor's
+            # degree." Mark as graduated (and inactive) rather than suspended,
+            # because suspension implies disciplinary action.
             self.conn.execute(
-                "UPDATE users SET suspended=1 WHERE id=?",
+                "UPDATE users SET graduated=1, suspended=1 WHERE id=?",
                 (row["student_id"],)
             )
 
         self.conn.commit()
+        if approve:
+            return "Graduation approved. The student has graduated with a Bachelor's degree."
         return f"Graduation application {status.lower()}."
 
     def get_users_by_role(self, role):
@@ -1089,7 +1215,12 @@ class College0DB:
             grades = [points[g["grade"]]
                       for g in grade_rows if g["grade"] in points]
             gpa = round(sum(grades) / len(grades), 2) if grades else 0.0
-            honor_roll = 1 if gpa > 3.75 else 0
+            # Spec honor-roll rule: semester GPA > 3.75 OR overall GPA > 3.5
+            # (the latter only after >1 semester). We don't track semesters
+            # per student, so we approximate the "more than one semester"
+            # qualifier with "graded in at least 4 classes" before applying
+            # the overall-GPA branch of the rule.
+            honor_roll = 1 if (gpa > 3.75 or (gpa > 3.5 and len(grades) >= 4)) else 0
             self.conn.execute("UPDATE student_profiles SET gpa=?, overall_gpa=?, honor_roll=? WHERE user_id=?",
                               (gpa, gpa, honor_roll, st["id"]))
             if gpa < 2.0 and grades:
@@ -1122,6 +1253,7 @@ class College0DB:
         cur = self.conn.cursor()
         cur.execute("""
         SELECT u.full_name, u.username, u.role, u.warnings, u.suspended,
+               COALESCE(u.graduated, 0) AS graduated,
                sp.gpa, sp.overall_gpa, sp.honor_roll, ip.avg_rating
         FROM users u
         LEFT JOIN student_profiles sp ON sp.user_id = u.id
@@ -1354,8 +1486,12 @@ class College0DB:
             }
         return {
             "answer": (
-                "No strong local match was found in the College0 knowledge store.\n\n"
-                "In the full project, this question would be sent to an external LLM for a possible answer."
+                "No strong match was found in the College0 local knowledge store (vector DB).\n\n"
+                "This question would now be forwarded to an external general-purpose LLM "
+                "for a possible answer.\n\n"
+                "WARNING: External LLM answers are NOT verified against College0 records "
+                "and may be hallucinated, outdated, or simply incorrect. Treat the response "
+                "as a hint only and confirm anything important with a registrar or instructor."
             ),
             "used_external": True,
         }
@@ -1747,9 +1883,39 @@ class College0App:
 
         dropdown["values"] = values
 
-        tk.Label(body, text="Stars (1-5)", bg=self.CARD).pack(anchor="w")
-        stars_entry = tk.Entry(body)
-        stars_entry.pack(fill="x", pady=5)
+        tk.Label(body, text="Star Rating", bg=self.CARD).pack(anchor="w")
+        stars_var = tk.IntVar(value=5)
+        stars_row = tk.Frame(body, bg=self.CARD)
+        stars_row.pack(anchor="w", pady=5)
+        star_buttons = []
+
+        def refresh_star_buttons():
+            selected_stars = stars_var.get()
+            for index, button in enumerate(star_buttons, start=1):
+                if index <= selected_stars:
+                    button.configure(text="★", fg=self.GOLD)
+                else:
+                    button.configure(text="☆", fg=self.MUTED)
+
+        for index in range(1, 6):
+            button = tk.Button(
+                stars_row,
+                text="☆",
+                command=lambda value=index: (stars_var.set(value), refresh_star_buttons()),
+                relief="flat",
+                bd=0,
+                bg=self.CARD,
+                activebackground=self.CARD,
+                activeforeground=self.GOLD,
+                fg=self.MUTED,
+                font=("Segoe UI Symbol", 20, "bold"),
+                cursor="hand2",
+                padx=2,
+                pady=0,
+            )
+            button.pack(side="left", padx=(0, 4))
+            star_buttons.append(button)
+        refresh_star_buttons()
 
     # Review text
         tk.Label(body, text="Review", bg=self.CARD).pack(anchor="w")
@@ -1762,11 +1928,8 @@ class College0App:
                 messagebox.showerror("Error", "Select a class")
                 return
 
-            try:
-                stars = int(stars_entry.get())
-                if stars < 1 or stars > 5:
-                    raise ValueError
-            except:
+            stars = stars_var.get()
+            if stars < 1 or stars > 5:
                 messagebox.showerror("Error", "Stars must be 1-5")
                 return
 
@@ -1784,11 +1947,16 @@ class College0App:
                 text
             )
 
-            messagebox.showinfo("Result", result)
+            if "received 2 warnings" in result:
+                messagebox.showwarning("Warning", result)
+            elif "received 1 warning" in result:
+                messagebox.showwarning("Warning", result)
+            else:
+                messagebox.showinfo("Result", result)
 
         tk.Button(body, text="Submit Review",
-                  command=submit,
-                  bg=self.NAV, fg="white").pack(pady=10)
+                command=submit,
+                bg=self.NAV, fg="white").pack(pady=10)
 
     def build_ai_page(self):
         frame = self.prepare_scrollable_page("AI")
@@ -1966,7 +2134,8 @@ class College0App:
         return tk.Listbox(parent, height=height, relief="flat", bg=self.CARD_ALT, fg=self.TEXT,
                           highlightthickness=1, highlightbackground=self.BORDER,
                           font=("Segoe UI", 10), selectbackground="#e5daf6",
-                          selectforeground=self.TEXT, activestyle="none")
+                          selectforeground=self.TEXT, activestyle="none",
+                          exportselection=False)
 
     def section_title(self, parent, title, subtitle=""):
         tk.Label(parent, text=title, bg=self.BG, fg=self.NAV_DARK,
@@ -2732,7 +2901,10 @@ class College0App:
         summary = self.db.get_user_summary(user["id"])
         top = tk.Frame(frame, bg=self.BG)
         top.pack(fill="x", padx=24, pady=22)
-        subtitle = f"{user['full_name']} | Warnings: {summary['warnings']} | Suspended: {'Yes' if summary['suspended'] else 'No'}"
+        is_graduated = bool(summary["graduated"]) if "graduated" in summary.keys() else False
+        status_label = "Graduated" if is_graduated else ("Yes" if summary["suspended"] else "No")
+        status_field = "Status" if is_graduated else "Suspended"
+        subtitle = f"{user['full_name']} | Warnings: {summary['warnings']} | {status_field}: {status_label}"
         if user["role"] == "Student":
             subtitle += f" | GPA: {summary['overall_gpa'] or 0.0}"
         elif user["role"] == "Instructor":
@@ -2741,10 +2913,18 @@ class College0App:
 
         quick = tk.Frame(frame, bg=self.BG)
         quick.pack(fill="x", padx=24, pady=(0, 12))
+        if is_graduated:
+            status_value = "Graduated"
+            status_color = self.NAV
+        elif summary["suspended"]:
+            status_value = "Suspended"
+            status_color = self.DANGER
+        else:
+            status_value = "Active"
+            status_color = self.SUCCESS
         for title, value, color in [
             ("Warnings", str(summary["warnings"]), self.GOLD),
-            ("Status", "Suspended" if summary["suspended"] else "Active",
-             self.DANGER if summary["suspended"] else self.SUCCESS),
+            ("Status", status_value, status_color),
             ("Period", self.db.get_current_period(), self.NAV),
         ]:
             card, body = self.make_card(quick, title)
@@ -2901,6 +3081,57 @@ class College0App:
         for c in complaints:
             complaint_list.insert(
                 tk.END, f"#{c['id']}  |  {c['filed_by']} -> {c['against_name']}  |  {c['status']}")
+
+        def show_complaint_popup(_event=None):
+            sel = complaint_list.curselection()
+            if not sel:
+                return
+            complaint = complaints[sel[0]]
+            top = tk.Toplevel(self.root)
+            top.title(f"Complaint #{complaint['id']}")
+            top.geometry("520x300")
+            top.configure(bg=self.BG)
+            top.transient(self.root)
+
+            card, body = self.make_card(
+                top,
+                f"Complaint #{complaint['id']}",
+                f"{complaint['filed_by']} -> {complaint['against_name']} | {complaint['status']}",
+            )
+            card.pack(fill="both", expand=True, padx=18, pady=18)
+
+            tk.Label(
+                body,
+                text="Complaint Detail",
+                bg=self.CARD,
+                fg=self.TEXT,
+                font=("Segoe UI", 10, "bold"),
+            ).pack(anchor="w", pady=(0, 6))
+
+            detail_box = tk.Text(
+                body, height=10, relief="solid", bd=1, font=("Segoe UI", 10), wrap="word"
+            )
+            detail_box.pack(fill="both", expand=True)
+            detail_box.insert("1.0", complaint["detail"])
+            detail_box.configure(state="disabled")
+
+            tk.Button(
+                body,
+                text="Close",
+                command=top.destroy,
+                relief="flat",
+                bg=self.NAV,
+                fg="white",
+                activebackground=self.NAV_LIGHT,
+                activeforeground="white",
+                font=("Segoe UI", 10, "bold"),
+                padx=16,
+                pady=8,
+                cursor="hand2",
+            ).pack(anchor="e", pady=(12, 0))
+
+        complaint_list.bind("<<ListboxSelect>>", show_complaint_popup)
+        complaint_list.bind("<Double-Button-1>", show_complaint_popup)
         c_btns = tk.Frame(complaint_body, bg=self.CARD)
         c_btns.pack(anchor="w", pady=(10, 0))
 
@@ -2926,17 +3157,37 @@ class College0App:
                   padx=14, pady=8, cursor="hand2").pack(side="left")
 
         setup_card, setup_body = self.make_card(
-            frame, "Class Setup", "During the Setup period, the registrar can adjust instructor, meeting time, and capacity.")
+            frame, "Class Setup", "During the Setup period, the registrar can adjust instructor, meeting time, and capacity. Cancelled classes can also be reactivated here.")
         setup_card.pack(fill="x", padx=24, pady=(12, 0))
         setup_row = tk.Frame(setup_body, bg=self.CARD)
         setup_row.pack(fill="x")
         class_setup_rows = self.db.get_class_setup_rows()
+        selected_setup_class_id = None
         class_setup_list = self.styled_listbox(setup_row, height=6)
         class_setup_list.pack(side="left", fill="both",
                               expand=True, padx=(0, 12))
-        for row_data in class_setup_rows:
-            class_setup_list.insert(
-                tk.END, f"#{row_data['id']} | {row_data['code']} {row_data['title']} | {row_data['meeting_time']} | cap {row_data['capacity']} | {row_data['instructor'] or 'TBD'}")
+        def refresh_setup_list(select_class_id=None):
+            nonlocal class_setup_rows, selected_setup_class_id
+            class_setup_rows = self.db.get_class_setup_rows()
+            class_setup_list.delete(0, tk.END)
+            selected_index = None
+            for index, row_data in enumerate(class_setup_rows):
+                cancelled_tag = "  [CANCELLED]" if row_data["cancelled"] else ""
+                class_setup_list.insert(
+                    tk.END,
+                    f"#{row_data['id']} | {row_data['code']} {row_data['title']} | {row_data['meeting_time']} | cap {row_data['capacity']} | {row_data['instructor'] or 'TBD'}{cancelled_tag}"
+                )
+                if select_class_id is not None and row_data["id"] == select_class_id:
+                    selected_index = index
+            if selected_index is not None:
+                selected_setup_class_id = select_class_id
+                class_setup_list.selection_clear(0, tk.END)
+                class_setup_list.selection_set(selected_index)
+                class_setup_list.activate(selected_index)
+                class_setup_list.see(selected_index)
+                load_setup_form()
+
+        refresh_setup_list()
 
         setup_form = tk.Frame(setup_row, bg=self.CARD)
         setup_form.pack(side="left", fill="y")
@@ -2961,10 +3212,12 @@ class College0App:
         capacity_entry.pack(fill="x", pady=(4, 10), ipady=4)
 
         def load_setup_form(_event=None):
+            nonlocal selected_setup_class_id
             sel = class_setup_list.curselection()
             if not sel:
                 return
             class_row = class_setup_rows[sel[0]]
+            selected_setup_class_id = class_row["id"]
             meeting_entry.delete(0, tk.END)
             meeting_entry.insert(0, class_row["meeting_time"])
             capacity_entry.delete(0, tk.END)
@@ -2977,10 +3230,21 @@ class College0App:
         class_setup_list.bind("<<ListboxSelect>>", load_setup_form)
 
         def save_setup():
-            sel = class_setup_list.curselection()
-            if not sel:
+            nonlocal class_setup_rows, selected_setup_class_id
+            if selected_setup_class_id is None:
+                messagebox.showerror(
+                    "Missing class", "Please select a class to update."
+                )
                 return
-            target = class_setup_rows[sel[0]]
+            target = next(
+                (row for row in class_setup_rows if row["id"] == selected_setup_class_id),
+                None,
+            )
+            if target is None:
+                messagebox.showerror(
+                    "Missing class", "The selected class could not be found."
+                )
+                return
             try:
                 capacity = int(capacity_entry.get().strip())
             except ValueError:
@@ -2995,11 +3259,71 @@ class College0App:
             result = self.db.update_class_setup(
                 target["id"], instructor_id, meeting_entry.get().strip(), capacity)
             messagebox.showinfo("Class Setup", result)
-            self.build_dashboard()
+            if result == "Class setup updated.":
+                refresh_setup_list(target["id"])
+                self.show_page("Dashboard", "Dashboard")
 
         tk.Button(setup_form, text="Save Class Setup", command=save_setup, relief="flat", bg=self.GOLD, fg=self.NAV,
                   activebackground="#c79310", activeforeground=self.NAV, font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(4, 0))
+
+        def reactivate_selected_class():
+            nonlocal selected_setup_class_id
+            sel = class_setup_list.curselection()
+            if not sel:
+                messagebox.showerror(
+                    "Missing class",
+                    "Please select a class from the list to reactivate."
+                )
+                return
+            target = class_setup_rows[sel[0]]
+            if not target["cancelled"]:
+                messagebox.showinfo(
+                    "Already active",
+                    f"{target['code']} {target['title']} is already active — nothing to reactivate."
+                )
+                return
+            result = self.db.reactivate_class(target["id"])
+            messagebox.showinfo("Reactivate Class", result)
+            if result.startswith("Class reactivated"):
+                refresh_setup_list(target["id"])
+
+        # Only show the Reactivate button when the system is in the Setup
+        # period — that's the only time reactivation is permitted by spec.
+        if self.db.get_current_period() == "Setup":
+            tk.Button(
+                setup_form,
+                text="Reactivate Selected Class",
+                command=reactivate_selected_class,
+                relief="flat",
+                bg=self.SUCCESS,
+                fg="white",
+                activebackground="#166b3a",
+                activeforeground="white",
+                font=("Segoe UI", 10, "bold"),
+                padx=16,
+                pady=8,
+                cursor="hand2",
+            ).pack(anchor="w", pady=(8, 0))
+            tk.Label(
+                setup_form,
+                text="Cancelled classes are tagged [CANCELLED] in the list.",
+                bg=self.CARD,
+                fg=self.MUTED,
+                font=("Segoe UI", 9),
+                justify="left",
+                wraplength=320,
+            ).pack(anchor="w", pady=(6, 0))
+        else:
+            tk.Label(
+                setup_form,
+                text="To reactivate a cancelled class, switch to the Setup period.",
+                bg=self.CARD,
+                fg=self.MUTED,
+                font=("Segoe UI", 9),
+                justify="left",
+                wraplength=320,
+            ).pack(anchor="w", pady=(8, 0))
 
         grad_card, grad_body = self.make_card(
             frame,
@@ -3099,12 +3423,22 @@ class College0App:
             top, "My Classes", "Current registrations and grades")
         my_card.pack(side="left", fill="both", expand=True, padx=(10, 0))
 
+        registrations = self.db.get_student_registrations(self.current_user["id"])
+        class_status = {}
+        for registration in registrations:
+            class_status[registration["class_id"]] = (
+                "Completed" if registration["grade"] else "Enrolled"
+            )
+
         classes = self.db.get_available_classes()
         class_list = self.styled_listbox(class_body, height=11)
         class_list.pack(fill="both", expand=True)
         for c in classes:
+            status_note = ""
+            if c["id"] in class_status:
+                status_note = f" | {class_status[c['id']]}"
             class_list.insert(
-                tk.END, f"#{c['id']}  |  {c['code']} {c['title']}  |  {c['meeting_time']}  |  {c['enrolled']}/{c['capacity']}  |  {c['period_state']}")
+                tk.END, f"#{c['id']}  |  {c['code']} {c['title']}  |  {c['meeting_time']}  |  {c['enrolled']}/{c['capacity']}  |  {c['period_state']}{status_note}")
 
         def apply_grad():
             msg = self.db.apply_for_graduation(self.current_user["id"])
@@ -3139,7 +3473,6 @@ class College0App:
 
         reg_list = self.styled_listbox(my_body, height=11)
         reg_list.pack(fill="both", expand=True)
-        registrations = self.db.get_student_registrations(self.current_user["id"])
         for r in registrations:
             reg_list.insert(
                 tk.END, f"#{r['class_id']}  |  {r['code']} {r['title']}  |  {r['meeting_time']}  |  Grade: {r['grade'] or 'N/A'}")
@@ -3168,19 +3501,18 @@ class College0App:
         )
         fine_card.pack(fill="x", pady=(16, 0))
 
-        fines = self.db.get_user_fines(self.current_user["id"])
+        fines = [f for f in self.db.get_user_fines(self.current_user["id"]) if not f["paid"]]
         fine_list = self.styled_listbox(fine_body, height=5)
         fine_list.pack(fill="x")
 
         if fines:
             for f in fines:
-                status = "Paid" if f["paid"] else "Unpaid"
                 fine_list.insert(
                     tk.END,
-                    f"#{f['id']} | ${f['amount']} | {status} | {f['reason']}"
+                    f"#{f['id']} | ${f['amount']} | Unpaid | {f['reason']}"
                 )
         else:
-            fine_list.insert(tk.END, "No fines found.")
+            fine_list.insert(tk.END, "No unpaid fines found.")
 
         def pay_my_fines():
             msg = self.db.pay_fine(self.current_user["id"])
@@ -3218,6 +3550,51 @@ class College0App:
         ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
 
     def build_instructor_dashboard(self, frame):
+        # Suspended-instructor banner: per spec, an instructor with 3 warnings
+        # or whose every class was cancelled is suspended and cannot teach
+        # next semester. Surface that as a prominent, unmissable banner so
+        # the instructor is not confused about their account state.
+        summary = self.db.get_user_summary(self.current_user["id"])
+        if summary and summary["suspended"]:
+            banner = tk.Frame(frame, bg=self.DANGER, bd=0, highlightthickness=2,
+                              highlightbackground="#7a1d2f")
+            banner.pack(fill="x", padx=24, pady=(0, 12))
+            inner = tk.Frame(banner, bg=self.DANGER)
+            inner.pack(fill="x", padx=18, pady=14)
+            tk.Label(
+                inner,
+                text="ACCOUNT SUSPENDED",
+                bg=self.DANGER,
+                fg="white",
+                font=("Segoe UI", 18, "bold"),
+            ).pack(anchor="w")
+            tk.Label(
+                inner,
+                text="YOU CAN'T TEACH NEXT SEMESTER",
+                bg=self.DANGER,
+                fg="#fff1a8",
+                font=("Segoe UI", 16, "bold"),
+            ).pack(anchor="w", pady=(6, 0))
+            tk.Label(
+                inner,
+                text=("Your instructor account "
+                      "has been suspended due to accumulated warnings or all of "
+                      "your classes being cancelled. Please contact the "
+                      "registrar to discuss your status."),
+                bg=self.DANGER,
+                fg="white",
+                font=("Segoe UI", 11, "bold"),
+                wraplength=900,
+                justify="left",
+            ).pack(anchor="w", pady=(6, 0))
+            tk.Label(
+                inner,
+                text=f"Current warnings on record: {summary['warnings']}",
+                bg=self.DANGER,
+                fg="#ffe0e0",
+                font=("Segoe UI", 10),
+            ).pack(anchor="w", pady=(8, 0))
+
         row = tk.Frame(frame, bg=self.BG)
         row.pack(fill="both", expand=True, padx=24, pady=8)
         top_card, top_body = self.make_card(
