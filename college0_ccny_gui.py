@@ -164,9 +164,20 @@ class College0DB:
             filed_by INTEGER NOT NULL,
             against_user INTEGER NOT NULL,
             detail TEXT NOT NULL,
-            status TEXT DEFAULT 'Open'
+            status TEXT DEFAULT 'Open',
+            complaint_type TEXT DEFAULT 'General Complaint',
+            class_id INTEGER,
+            FOREIGN KEY(class_id) REFERENCES classes(id)
         )
         """)
+        try:
+            cur.execute("ALTER TABLE complaints ADD COLUMN complaint_type TEXT DEFAULT 'General Complaint'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cur.execute("ALTER TABLE complaints ADD COLUMN class_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS graduation_applications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,6 +186,21 @@ class College0DB:
             decision_note TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             FOREIGN KEY(student_id) REFERENCES users(id)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS instructor_grade_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_id INTEGER NOT NULL,
+            instructor_id INTEGER NOT NULL,
+            class_gpa REAL NOT NULL,
+            concern TEXT NOT NULL,
+            status TEXT DEFAULT 'Pending',
+            justification TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE(class_id, concern, status),
+            FOREIGN KEY(class_id) REFERENCES classes(id),
+            FOREIGN KEY(instructor_id) REFERENCES users(id)
         )
         """)
 
@@ -680,6 +706,51 @@ class College0DB:
         """, (student_id,))
         return cur.fetchall()
 
+    def get_student_degree_audit(self, student_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT code, title
+            FROM courses
+            WHERE required = 1
+            ORDER BY code
+        """)
+        required_courses = [dict(row) for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT cl.id AS class_id, c.code, c.title, cl.meeting_time, r.grade
+            FROM registrations r
+            JOIN classes cl ON cl.id = r.class_id
+            JOIN courses c ON c.id = cl.course_id
+            WHERE r.student_id = ?
+            ORDER BY c.code
+        """, (student_id,))
+        rows = [dict(row) for row in cur.fetchall()]
+
+        required_progress = []
+        for course in required_courses:
+            matching = [row for row in rows if row["code"] == course["code"]]
+            passed = any((row["grade"] or "").upper() not in {"", "F"} for row in matching)
+            in_progress = any(not row["grade"] for row in matching)
+            failed = any((row["grade"] or "").upper() == "F" for row in matching)
+            if passed:
+                status = "Completed"
+            elif in_progress:
+                status = "In Progress"
+            elif failed:
+                status = "Needs Retake"
+            else:
+                status = "Missing"
+            required_progress.append(
+                {"code": course["code"], "title": course["title"], "status": status}
+            )
+
+        return {
+            "required_courses": required_progress,
+            "graded_rows": [row for row in rows if row["grade"]],
+            "active_rows": [row for row in rows if not row["grade"]],
+            "completed_count": sum(1 for row in rows if row["grade"] != ""),
+        }
+
     def get_student_registration_count(self, student_id):
         cur = self.conn.cursor()
         cur.execute(
@@ -941,9 +1012,11 @@ class College0DB:
         """)
         return cur.fetchall()
 
-    def file_complaint(self, filed_by, against_user, detail):
-        self.conn.execute("INSERT INTO complaints(filed_by, against_user, detail) VALUES (?, ?, ?)",
-                          (filed_by, against_user, detail))
+    def file_complaint(self, filed_by, against_user, detail, complaint_type="General Complaint", class_id=None):
+        self.conn.execute("""
+            INSERT INTO complaints(filed_by, against_user, detail, complaint_type, class_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (filed_by, against_user, detail, complaint_type, class_id))
         self.conn.commit()
 
     def apply_for_graduation(self, student_id):
@@ -1042,13 +1115,35 @@ class College0DB:
     def get_complaints(self):
         cur = self.conn.cursor()
         cur.execute("""
-        SELECT c.id, uf.full_name AS filed_by, ua.full_name AS against_name, c.detail, c.status
+        SELECT c.id, c.filed_by, c.against_user,
+               uf.full_name AS filed_by, uf.role AS filed_by_role,
+               ua.full_name AS against_name, ua.role AS against_role,
+               c.detail, c.status, c.complaint_type, c.class_id,
+               co.code AS class_code, co.title AS class_title
         FROM complaints c
         JOIN users uf ON uf.id = c.filed_by
         JOIN users ua ON ua.id = c.against_user
+        LEFT JOIN classes cl ON cl.id = c.class_id
+        LEFT JOIN courses co ON co.id = cl.course_id
         ORDER BY c.id DESC
         """)
         return cur.fetchall()
+
+    def deregister_student_by_registrar(self, student_id, class_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT r.id, c.code, c.title
+            FROM registrations r
+            JOIN classes cl ON cl.id = r.class_id
+            JOIN courses c ON c.id = cl.course_id
+            WHERE r.student_id=? AND r.class_id=?
+        """, (student_id, class_id))
+        row = cur.fetchone()
+        if not row:
+            return "The student is not currently registered in that class."
+        self.conn.execute("DELETE FROM registrations WHERE id=?", (row["id"],))
+        self.conn.commit()
+        return f"Student was de-registered from {row['code']} {row['title']}."
 
     def resolve_complaint(self, complaint_id, punish_against=True):
         cur = self.conn.cursor()
@@ -1066,6 +1161,43 @@ class College0DB:
             status = "Resolved - warning issued to filer"
         self.conn.execute(
             "UPDATE complaints SET status=? WHERE id=?", (status, complaint_id))
+        self.conn.commit()
+        return status
+
+    def decide_complaint(self, complaint_id, action):
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,))
+        row = cur.fetchone()
+        if not row:
+            return "Complaint not found."
+        if row["status"] != "Open":
+            return "Complaint is already resolved."
+
+        if action == "warn_accused":
+            self.issue_warning(
+                row["against_user"], f"complaint_against_{complaint_id}", 1
+            )
+            status = "Resolved - warning issued to accused"
+        elif action == "warn_filer":
+            self.issue_warning(
+                row["filed_by"], f"complaint_filer_{complaint_id}", 1
+            )
+            status = "Resolved - warning issued to filer"
+        elif action == "deregister_student":
+            if row["complaint_type"] != "Instructor Report" or not row["class_id"]:
+                return "Only instructor reports tied to a class can de-register a student."
+            result = self.deregister_student_by_registrar(
+                row["against_user"], row["class_id"]
+            )
+            if not result.startswith("Student was de-registered"):
+                return result
+            status = "Resolved - student de-registered"
+        else:
+            return "Unknown complaint action."
+
+        self.conn.execute(
+            "UPDATE complaints SET status=? WHERE id=?", (status, complaint_id)
+        )
         self.conn.commit()
         return status
 
@@ -1135,11 +1267,16 @@ class College0DB:
                 self.issue_warning(
                     row["instructor_id"], f"missing_grades_{row['id']}", 1)
                 messages.append(f"{row['code']} has missing grades.")
-        self.audit_instructor_class_performance()
+        review_count = self.audit_instructor_class_performance()
+        if review_count:
+            messages.append(
+                f"{review_count} instructor class GPA case(s) were sent to the registrar for review."
+            )
         return " ".join(messages[:4])
 
     def audit_instructor_class_performance(self):
         cur = self.conn.cursor()
+        queued_reviews = 0
 
         cur.execute("""
             SELECT cl.id AS class_id, cl.instructor_id, c.code
@@ -1168,22 +1305,96 @@ class College0DB:
             if not values:
                 continue
 
-            class_gpa = sum(values) / len(values)
+            class_gpa = round(sum(values) / len(values), 2)
 
             if class_gpa > 3.5:
-                self.issue_warning(
-                    instructor_id, f"grade_inflation_{class_id}", 1)
-
+                queued_reviews += self.queue_instructor_grade_review(
+                    class_id, instructor_id, class_gpa, "High class GPA"
+                )
             elif class_gpa < 2.5:
-                self.issue_warning(
-                    instructor_id, f"low_class_performance_{class_id}", 2)
-
-                self.conn.execute(
-                    "UPDATE users SET suspended=1 WHERE id=?",
-                    (instructor_id,)
+                queued_reviews += self.queue_instructor_grade_review(
+                    class_id, instructor_id, class_gpa, "Low class GPA"
                 )
 
         self.conn.commit()
+        return queued_reviews
+
+    def queue_instructor_grade_review(self, class_id, instructor_id, class_gpa, concern):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id
+            FROM instructor_grade_reviews
+            WHERE class_id=? AND concern=? AND status='Pending'
+        """, (class_id, concern))
+        if cur.fetchone():
+            return 0
+        self.conn.execute("""
+            INSERT INTO instructor_grade_reviews(
+                class_id, instructor_id, class_gpa, concern, status, justification, created_at
+            )
+            VALUES (?, ?, ?, ?, 'Pending', '', ?)
+        """, (class_id, instructor_id, class_gpa, concern, datetime.now().isoformat()))
+        return 1
+
+    def get_instructor_grade_reviews(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT igr.id, igr.class_id, igr.instructor_id, igr.class_gpa, igr.concern,
+                   igr.status, igr.justification, igr.created_at,
+                   c.code, c.title, u.full_name AS instructor_name
+            FROM instructor_grade_reviews igr
+            JOIN classes cl ON cl.id = igr.class_id
+            JOIN courses c ON c.id = cl.course_id
+            JOIN users u ON u.id = igr.instructor_id
+            ORDER BY CASE WHEN igr.status='Pending' THEN 0 ELSE 1 END, igr.id DESC
+        """)
+        return cur.fetchall()
+
+    def decide_instructor_grade_review(self, review_id, action, justification=""):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT *
+            FROM instructor_grade_reviews
+            WHERE id=?
+        """, (review_id,))
+        review = cur.fetchone()
+        if not review:
+            return "Instructor GPA review not found."
+        if review["status"] != "Pending":
+            return "This instructor GPA review was already resolved."
+
+        note = justification.strip()
+        if action in {"warn", "fire"} and not note:
+            return "A justification is required before warning or firing the instructor."
+
+        if action == "justify":
+            final_status = "Cleared with justification"
+        elif action == "warn":
+            final_status = "Resolved - warning issued"
+            self.issue_warning(
+                review["instructor_id"], f"instructor_grade_review_warn_{review_id}", 1
+            )
+        elif action == "fire":
+            final_status = "Resolved - instructor fired"
+            self.conn.execute(
+                "UPDATE users SET suspended=1 WHERE id=?",
+                (review["instructor_id"],)
+            )
+        else:
+            return "Unknown instructor review action."
+
+        self.conn.execute("""
+            UPDATE instructor_grade_reviews
+            SET status=?, justification=?
+            WHERE id=?
+        """, (final_status, note or "Adequate justification accepted.", review_id))
+        self.conn.commit()
+
+        if action == "justify":
+            return "Instructor GPA review cleared with justification."
+        if action == "warn":
+            return "Instructor warned after registrar review."
+        return "Instructor fired after registrar review."
 
     def update_instructor_ratings(self):
         cur = self.conn.cursor()
@@ -1319,7 +1530,7 @@ class College0DB:
             "graduation", "requirements", "required", "graduate", "finish", "degree"
         )
         add_fact(
-            "Warning and suspension rules: 3 warnings trigger suspension and a $500 fine. GPA below 2.0 after grading also suspends a student. GPA from 2.0 to 2.25 gives a warning. Failing the same course twice suspends the student.",
+            "Warning and suspension rules: 3 warnings trigger suspension and a $500 fine. GPA below 2.0 after grading suspends a student. GPA from 2.0 to 2.25 gives a warning. Failing the same course twice suspends the student. Instructors with class GPA above 3.5 or below 2.5 are sent to the registrar for review, where the registrar can accept a justification, warn the instructor, or fire the instructor.",
             "warnings", "suspension", "gpa", "fine", "failed", "rules"
         )
         add_fact(
@@ -1335,8 +1546,8 @@ class College0DB:
             "honor", "honor_roll", "gpa", "warnings", "rules"
         )
         add_fact(
-            f"Complaint rules: students can file complaints against other students or instructors, instructors can file complaints against students in their class, and the registrar resolves complaints by warning either the accused or the filer. There are currently {len(complaints)} complaint records.",
-            "complaint", "rules", "registrar", "student", "instructor", "warning"
+            f"Complaint rules: students can file complaints against other students or instructors, instructors can file complaints against students in their own class, and the registrar can warn the accused, warn the filer, or de-register a reported student from the instructor's class after review. Students who reach 3 warnings are suspended and fined automatically. There are currently {len(complaints)} complaint records.",
+            "complaint", "rules", "registrar", "student", "instructor", "warning", "deregister", "fine", "suspension"
         )
         add_fact(
             f"Current available classes: {len(available_classes)} active classes are listed this period.",
@@ -1516,6 +1727,7 @@ class College0App:
     WARNING_BG = "#fff1a8"
     WARNING_BORDER = "#d7b83f"
     WARNING_TEXT = "#5f4a00"
+    GRADE_POINTS = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "F": 0.0}
 
     def __init__(self, root):
         self.root = root
@@ -1805,8 +2017,12 @@ class College0App:
 
         tk.Label(body, text="Select User", bg=self.CARD).pack(anchor="w")
 
-        users = self.db.get_users_by_role(
-            "Instructor") + self.db.get_users_by_role("Student")
+        users = [
+            user for user in
+            (self.db.get_users_by_role("Instructor") +
+             self.db.get_users_by_role("Student"))
+            if user["id"] != self.current_user["id"]
+        ]
 
         user_map = {}
         user_var = tk.StringVar()
@@ -1840,10 +2056,12 @@ class College0App:
             self.db.file_complaint(
                 self.current_user["id"],
                 user_map[selected],
-                detail
+                detail,
+                "Student Complaint",
             )
 
             messagebox.showinfo("Success", "Complaint submitted")
+            detail_box.delete("1.0", tk.END)
 
         tk.Button(body, text="Submit Complaint",
                   command=submit,
@@ -2447,6 +2665,188 @@ class College0App:
         tk.Button(action_row, text="Clear", command=clear_ai, relief="flat", bg=self.CARD_ALT, fg=self.NAV_DARK,
                   activebackground="#efe7fb", activeforeground=self.NAV_DARK, font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(side="left", padx=(8, 0))
+        return card
+
+    def build_student_planner_card(self, parent):
+        audit = self.db.get_student_degree_audit(self.current_user["id"])
+        card, body = self.make_card(
+            parent,
+            "Graduation & GPA Planner",
+            "Creative feature: preview projected grades, GPA outcomes, and graduation readiness.",
+        )
+        card.pack(fill="x", pady=(16, 0))
+
+        tk.Label(
+            body,
+            text=(
+                f"Completed classes: {audit['completed_count']}/8"
+                f"  |  Required courses tracked: {len(audit['required_courses'])}"
+            ),
+            bg=self.CARD,
+            fg=self.TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        required_lines = [
+            f"{course['code']} {course['title']}: {course['status']}"
+            for course in audit["required_courses"]
+        ]
+        tk.Label(
+            body,
+            text="Required course progress:\n" + "\n".join(required_lines),
+            justify="left",
+            anchor="w",
+            bg=self.CARD_ALT,
+            fg=self.TEXT,
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=10,
+        ).pack(fill="x", pady=(0, 12))
+
+        projected_vars = {}
+        if audit["active_rows"]:
+            tk.Label(
+                body,
+                text="Projected grades for your active classes",
+                bg=self.CARD,
+                fg=self.TEXT,
+                font=("Segoe UI", 10, "bold"),
+            ).pack(anchor="w", pady=(0, 8))
+            planner_grid = tk.Frame(body, bg=self.CARD)
+            planner_grid.pack(fill="x", pady=(0, 10))
+            for row in audit["active_rows"]:
+                grade_var = tk.StringVar(value="B")
+                projected_vars[row["class_id"]] = grade_var
+                line = tk.Frame(planner_grid, bg=self.CARD)
+                line.pack(fill="x", pady=3)
+                tk.Label(
+                    line,
+                    text=f"{row['code']} {row['title']} | {row['meeting_time']}",
+                    bg=self.CARD,
+                    fg=self.TEXT,
+                    font=("Segoe UI", 10),
+                ).pack(side="left")
+                ttk.Combobox(
+                    line,
+                    textvariable=grade_var,
+                    values=list(self.GRADE_POINTS.keys()),
+                    state="readonly",
+                    width=5,
+                ).pack(side="right")
+        else:
+            tk.Label(
+                body,
+                text="No active classes are waiting for grades right now.",
+                bg=self.CARD_ALT,
+                fg=self.MUTED,
+                font=("Segoe UI", 10),
+                padx=12,
+                pady=10,
+            ).pack(fill="x", pady=(0, 10))
+
+        result_var = tk.StringVar(
+            value="Choose projected grades and click Preview Outcome to estimate your semester path."
+        )
+
+        def preview_outcome():
+            graded_rows = audit["graded_rows"]
+            projected_rows = []
+            for row in audit["active_rows"]:
+                projected_rows.append(
+                    dict(row) | {
+                        "projected_grade": projected_vars[row["class_id"]].get() or "B"
+                    }
+                )
+
+            graded_points = sum(
+                self.GRADE_POINTS.get((row["grade"] or "").upper(), 0.0)
+                for row in graded_rows
+            )
+            projected_points = sum(
+                self.GRADE_POINTS[row["projected_grade"]]
+                for row in projected_rows
+            )
+            projected_semester_gpa = (
+                projected_points / len(projected_rows) if projected_rows else None
+            )
+            total_completed_after_term = audit["completed_count"] + len(projected_rows)
+            total_graded_after_term = len(graded_rows) + len(projected_rows)
+            projected_overall_gpa = (
+                (graded_points + projected_points) / total_graded_after_term
+                if total_graded_after_term
+                else 0.0
+            )
+
+            missing_required = []
+            for course in audit["required_courses"]:
+                currently_passed = course["status"] == "Completed"
+                projected_pass = any(
+                    row["code"] == course["code"] and row["projected_grade"] != "F"
+                    for row in projected_rows
+                )
+                if not (currently_passed or projected_pass):
+                    missing_required.append(course["code"])
+
+            status_note = "Projected status: in good standing."
+            if projected_overall_gpa < 2.0:
+                status_note = "Projected status: below 2.0, which would put you in automatic termination range."
+            elif projected_overall_gpa <= 2.25:
+                status_note = "Projected status: between 2.0 and 2.25, which would trigger a registrar interview warning."
+
+            honor_note = "Honor roll outlook: not yet."
+            if projected_semester_gpa is not None and projected_semester_gpa > 3.75:
+                honor_note = "Honor roll outlook: yes, this semester projection reaches the honor-roll threshold."
+            elif projected_overall_gpa > 3.5 and total_graded_after_term > len(projected_rows):
+                honor_note = "Honor roll outlook: yes, your projected overall GPA would stay above 3.5."
+
+            if total_completed_after_term >= 8 and not missing_required:
+                graduation_note = "Graduation outlook: eligible to apply after these classes are completed."
+            else:
+                graduation_note = (
+                    f"Graduation outlook: not ready yet. Missing required courses: "
+                    f"{', '.join(missing_required) if missing_required else 'none'}, "
+                    f"completed classes after term: {total_completed_after_term}/8."
+                )
+
+            lines = []
+            if projected_semester_gpa is None:
+                lines.append(
+                    "Projected semester GPA: no active in-progress classes to estimate."
+                )
+            else:
+                lines.append(f"Projected semester GPA: {projected_semester_gpa:.2f}")
+            lines.append(f"Projected overall GPA: {projected_overall_gpa:.2f}")
+            lines.append(status_note)
+            lines.append(honor_note)
+            lines.append(graduation_note)
+            result_var.set("\n".join(lines))
+
+        tk.Button(
+            body,
+            text="Preview Outcome",
+            command=preview_outcome,
+            relief="flat",
+            bg=self.GOLD,
+            fg=self.NAV,
+            font=("Segoe UI", 10, "bold"),
+            padx=16,
+            pady=8,
+            cursor="hand2",
+        ).pack(anchor="w", pady=(0, 10))
+
+        tk.Label(
+            body,
+            textvariable=result_var,
+            justify="left",
+            anchor="w",
+            wraplength=860,
+            bg="#fff8e8",
+            fg=self.TEXT,
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=10,
+        ).pack(fill="x")
+
         return card
 
     def make_feature_card(self, parent, badge, title, items, extra_items=None):
@@ -3079,8 +3479,11 @@ class College0App:
         complaint_list = self.styled_listbox(complaint_body, height=13)
         complaint_list.pack(fill="both", expand=True)
         for c in complaints:
+            complaint_target = c["class_code"] if c["class_code"] else c["against_role"]
             complaint_list.insert(
-                tk.END, f"#{c['id']}  |  {c['filed_by']} -> {c['against_name']}  |  {c['status']}")
+                tk.END,
+                f"#{c['id']}  |  {c['complaint_type']}  |  {c['filed_by']} -> {c['against_name']}  |  {complaint_target}  |  {c['status']}"
+            )
 
         def show_complaint_popup(_event=None):
             sel = complaint_list.curselection()
@@ -3089,9 +3492,13 @@ class College0App:
             complaint = complaints[sel[0]]
             top = tk.Toplevel(self.root)
             top.title(f"Complaint #{complaint['id']}")
-            top.geometry("520x300")
+            top.geometry("640x420")
+            top.minsize(560, 360)
             top.configure(bg=self.BG)
             top.transient(self.root)
+            top.lift()
+            top.focus_force()
+            top.grab_set()
 
             card, body = self.make_card(
                 top,
@@ -3100,19 +3507,49 @@ class College0App:
             )
             card.pack(fill="both", expand=True, padx=18, pady=18)
 
+            meta_lines = [
+                f"Type: {complaint['complaint_type']}",
+                f"Filed by: {complaint['filed_by']} ({complaint['filed_by_role']})",
+                f"Against: {complaint['against_name']} ({complaint['against_role']})",
+            ]
+            if complaint["class_code"]:
+                meta_lines.append(
+                    f"Class: {complaint['class_code']} {complaint['class_title']}"
+                )
+            tk.Label(
+                body,
+                text="\n".join(meta_lines),
+                justify="left",
+                anchor="w",
+                bg=self.CARD,
+                fg=self.MUTED,
+                font=("Segoe UI", 10),
+            ).pack(fill="x", pady=(0, 12))
+
             tk.Label(
                 body,
                 text="Complaint Detail",
                 bg=self.CARD,
                 fg=self.TEXT,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 11, "bold"),
             ).pack(anchor="w", pady=(0, 6))
 
             detail_box = tk.Text(
-                body, height=10, relief="solid", bd=1, font=("Segoe UI", 10), wrap="word"
+                body,
+                height=12,
+                relief="solid",
+                bd=1,
+                font=("Segoe UI", 10),
+                wrap="word",
+                bg="white",
+                fg=self.TEXT,
+                disabledforeground=self.TEXT,
+                insertbackground=self.TEXT,
+                padx=10,
+                pady=10,
             )
             detail_box.pack(fill="both", expand=True)
-            detail_box.insert("1.0", complaint["detail"])
+            detail_box.insert("1.0", complaint["detail"] or "No complaint detail provided.")
             detail_box.configure(state="disabled")
 
             tk.Button(
@@ -3139,14 +3576,30 @@ class College0App:
             sel = complaint_list.curselection()
             if not sel:
                 return
-            self.db.resolve_complaint(complaints[sel[0]]["id"], True)
+            result = self.db.decide_complaint(
+                complaints[sel[0]]["id"], "warn_accused")
+            messagebox.showinfo("Complaint", result)
             self.build_dashboard()
 
         def warn_filer():
             sel = complaint_list.curselection()
             if not sel:
                 return
-            self.db.resolve_complaint(complaints[sel[0]]["id"], False)
+            result = self.db.decide_complaint(
+                complaints[sel[0]]["id"], "warn_filer")
+            messagebox.showinfo("Complaint", result)
+            self.build_dashboard()
+
+        def deregister_student():
+            sel = complaint_list.curselection()
+            if not sel:
+                return
+            result = self.db.decide_complaint(
+                complaints[sel[0]]["id"], "deregister_student")
+            if result.startswith("Resolved"):
+                messagebox.showinfo("Complaint", result)
+            else:
+                messagebox.showwarning("Complaint", result)
             self.build_dashboard()
 
         tk.Button(c_btns, text="Warn Accused", command=warn_accused, relief="flat", bg=self.GOLD, fg=self.NAV,
@@ -3154,6 +3607,9 @@ class College0App:
                   padx=14, pady=8, cursor="hand2").pack(side="left", padx=(0, 8))
         tk.Button(c_btns, text="Warn Filer", command=warn_filer, relief="flat", bg=self.NAV, fg="white",
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
+                  padx=14, pady=8, cursor="hand2").pack(side="left", padx=(0, 8))
+        tk.Button(c_btns, text="De-register Student", command=deregister_student, relief="flat", bg="#b14444", fg="white",
+                  activebackground="#933838", activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=14, pady=8, cursor="hand2").pack(side="left")
 
         setup_card, setup_body = self.make_card(
@@ -3400,6 +3856,157 @@ class College0App:
         else:
             fine_list.insert(tk.END, "No fines found.")
 
+        grade_review_card, grade_review_body = self.make_card(
+            frame,
+            "Instructor GPA Reviews",
+            "During and after grading, class GPA outliers are routed here for registrar review."
+        )
+        grade_review_card.pack(fill="x", padx=24, pady=(12, 0))
+
+        grade_reviews = self.db.get_instructor_grade_reviews()
+        grade_review_list = self.styled_listbox(grade_review_body, height=6)
+        grade_review_list.pack(fill="x")
+        for review in grade_reviews:
+            grade_review_list.insert(
+                tk.END,
+                f"#{review['id']} | {review['instructor_name']} | {review['code']} {review['title']} | GPA {review['class_gpa']} | {review['concern']} | {review['status']}"
+            )
+
+        tk.Label(
+            grade_review_body,
+            text="Registrar Justification / Decision Note",
+            bg=self.CARD,
+            fg=self.TEXT,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", pady=(10, 4))
+        grade_review_note = tk.Text(
+            grade_review_body, height=3, relief="solid", bd=1, font=("Segoe UI", 10)
+        )
+        grade_review_note.pack(fill="x")
+
+        def show_grade_review_popup(_event=None):
+            sel = grade_review_list.curselection()
+            if not sel:
+                return
+            review = grade_reviews[sel[0]]
+            top = tk.Toplevel(self.root)
+            top.title(f"Instructor GPA Review #{review['id']}")
+            top.geometry("560x320")
+            top.configure(bg=self.BG)
+            top.transient(self.root)
+
+            card, body = self.make_card(
+                top,
+                f"Instructor GPA Review #{review['id']}",
+                f"{review['instructor_name']} | {review['code']} {review['title']} | GPA {review['class_gpa']} | {review['status']}",
+            )
+            card.pack(fill="both", expand=True, padx=18, pady=18)
+
+            tk.Label(
+                body,
+                text=f"Concern: {review['concern']}",
+                bg=self.CARD,
+                fg=self.DANGER if review["concern"] == "Low class GPA" else self.NAV_DARK,
+                font=("Segoe UI", 11, "bold"),
+            ).pack(anchor="w")
+
+            tk.Label(
+                body,
+                text=("Registrar review required. Accept a justification, issue a warning, "
+                      "or fire the instructor if the explanation is not adequate."),
+                bg=self.CARD,
+                fg=self.TEXT,
+                font=("Segoe UI", 10),
+                wraplength=480,
+                justify="left",
+            ).pack(anchor="w", pady=(8, 10))
+
+            detail_box = tk.Text(
+                body, height=8, relief="solid", bd=1, font=("Segoe UI", 10), wrap="word"
+            )
+            detail_box.pack(fill="both", expand=True)
+            detail_box.insert(
+                "1.0",
+                review["justification"] or "No registrar justification has been recorded yet."
+            )
+            detail_box.configure(state="disabled")
+
+            tk.Button(
+                body,
+                text="Close",
+                command=top.destroy,
+                relief="flat",
+                bg=self.NAV,
+                fg="white",
+                activebackground=self.NAV_LIGHT,
+                activeforeground="white",
+                font=("Segoe UI", 10, "bold"),
+                padx=16,
+                pady=8,
+                cursor="hand2",
+            ).pack(anchor="e", pady=(12, 0))
+
+        grade_review_list.bind("<<ListboxSelect>>", show_grade_review_popup)
+        grade_review_list.bind("<Double-Button-1>", show_grade_review_popup)
+
+        grade_review_btns = tk.Frame(grade_review_body, bg=self.CARD)
+        grade_review_btns.pack(anchor="w", pady=(10, 0))
+
+        def resolve_grade_review(action):
+            sel = grade_review_list.curselection()
+            if not sel:
+                return
+            result = self.db.decide_instructor_grade_review(
+                grade_reviews[sel[0]]["id"],
+                action,
+                grade_review_note.get("1.0", tk.END)
+            )
+            messagebox.showinfo("Instructor GPA Review", result)
+            self.build_dashboard()
+
+        tk.Button(
+            grade_review_btns,
+            text="Accept Justification",
+            command=lambda: resolve_grade_review("justify"),
+            relief="flat",
+            bg=self.SUCCESS,
+            fg="white",
+            activebackground="#166b3a",
+            activeforeground="white",
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        ).pack(side="left", padx=(0, 8))
+        tk.Button(
+            grade_review_btns,
+            text="Warn Instructor",
+            command=lambda: resolve_grade_review("warn"),
+            relief="flat",
+            bg=self.GOLD,
+            fg=self.NAV,
+            activebackground="#c79310",
+            activeforeground=self.NAV,
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        ).pack(side="left", padx=(0, 8))
+        tk.Button(
+            grade_review_btns,
+            text="Fire Instructor",
+            command=lambda: resolve_grade_review("fire"),
+            relief="flat",
+            bg=self.DANGER,
+            fg="white",
+            activebackground="#a73a2f",
+            activeforeground="white",
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        ).pack(side="left")
+
         ai_card = self.build_ai_panel(
             frame, self.current_user, "Registrar Management Assistant")
         ai_card.pack(fill="both", expand=False, padx=24, pady=(12, 0))
@@ -3493,6 +4100,8 @@ class College0App:
         tk.Button(my_body, text="Unenroll Selected Class", command=unenroll, relief="flat", bg=self.DANGER, fg="white",
                   activebackground="#a73a2f", activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(10, 0))
+
+        self.build_student_planner_card(row)
 
         fine_card, fine_body = self.make_card(
             row,
@@ -3709,9 +4318,10 @@ class College0App:
             load_class_data(event), refresh_complaint_targets(event)))
 
         def file_instructor_complaint():
+            sel_class = class_list.curselection()
             target_text = complaint_target_var.get()
             detail = instructor_complaint_text.get("1.0", tk.END).strip()
-            if not target_text or not detail:
+            if not sel_class or not target_text or not detail:
                 messagebox.showerror(
                     "Missing info", "Select a class, choose a student, and enter complaint details.")
                 return
@@ -3723,8 +4333,14 @@ class College0App:
                 messagebox.showerror(
                     "Missing student", "Please choose a student from the selected class.")
                 return
+            selected_class = classes[sel_class[0]]
             self.db.file_complaint(
-                self.current_user["id"], target["student_id"], detail)
+                self.current_user["id"],
+                target["student_id"],
+                detail,
+                "Instructor Report",
+                selected_class["id"],
+            )
             messagebox.showinfo(
                 "Complaint", "Complaint submitted to the registrar.")
             self.build_dashboard()
