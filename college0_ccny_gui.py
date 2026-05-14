@@ -640,6 +640,49 @@ class College0DB:
         except sqlite3.IntegrityError:
             return "Already registered for this class."
 
+    def unenroll_student(self, student_id, class_id):
+        cur = self.conn.cursor()
+        current_period = self.get_current_period()
+        if current_period not in {"Registration", "Special Registration"}:
+            return "Unenrollment is only allowed during the Registration or Special Registration period."
+
+        cur.execute(
+            "SELECT id, grade FROM registrations WHERE student_id=? AND class_id=?",
+            (student_id, class_id),
+        )
+        registration = cur.fetchone()
+        if not registration:
+            return "You are not enrolled in that class."
+        if registration["grade"]:
+            return "You cannot unenroll after a grade has been posted."
+
+        cur.execute("DELETE FROM registrations WHERE id=?", (registration["id"],))
+
+        waitlist_note = ""
+        cur.execute("""
+            SELECT w.id, w.student_id, u.suspended
+            FROM waitlist w
+            JOIN users u ON u.id = w.student_id
+            WHERE w.class_id=?
+            ORDER BY w.created_at, w.id
+        """, (class_id,))
+        for waiter in cur.fetchall():
+            cur.execute("DELETE FROM waitlist WHERE id=?", (waiter["id"],))
+            if waiter["suspended"]:
+                continue
+            try:
+                cur.execute(
+                    "INSERT INTO registrations(class_id, student_id) VALUES (?, ?)",
+                    (class_id, waiter["student_id"]),
+                )
+                waitlist_note = " The next wait-listed student was admitted automatically."
+                break
+            except sqlite3.IntegrityError:
+                continue
+
+        self.conn.commit()
+        return "Unenrolled successfully." + waitlist_note
+
     def get_instructor_classes(self, instructor_id):
         cur = self.conn.cursor()
         cur.execute("""
@@ -3096,9 +3139,27 @@ class College0App:
 
         reg_list = self.styled_listbox(my_body, height=11)
         reg_list.pack(fill="both", expand=True)
-        for r in self.db.get_student_registrations(self.current_user["id"]):
+        registrations = self.db.get_student_registrations(self.current_user["id"])
+        for r in registrations:
             reg_list.insert(
                 tk.END, f"#{r['class_id']}  |  {r['code']} {r['title']}  |  {r['meeting_time']}  |  Grade: {r['grade'] or 'N/A'}")
+
+        def unenroll():
+            sel = reg_list.curselection()
+            if not sel:
+                messagebox.showerror(
+                    "Missing class", "Select a class from My Classes first."
+                )
+                return
+            msg = self.db.unenroll_student(
+                self.current_user["id"], registrations[sel[0]]["class_id"]
+            )
+            messagebox.showinfo("Unenroll", msg)
+            self.build_dashboard()
+
+        tk.Button(my_body, text="Unenroll Selected Class", command=unenroll, relief="flat", bg=self.DANGER, fg="white",
+                  activebackground="#a73a2f", activeforeground="white", font=("Segoe UI", 10, "bold"),
+                  padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(10, 0))
 
         fine_card, fine_body = self.make_card(
             row,
