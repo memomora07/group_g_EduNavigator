@@ -340,7 +340,7 @@ class College0DB:
         self.refresh_user_status(user_id)
         self.conn.commit()
         return True
-    
+
     def issue_fine(self, user_id, amount, reason):
 
         self.conn.execute("""
@@ -348,7 +348,7 @@ class College0DB:
             VALUES (?, ?, ?, ?)
         """, (user_id, amount, reason, datetime.now().isoformat()))
         self.conn.commit()
-    
+
     def pay_fine(self, user_id):
         cur = self.conn.cursor()
         cur.execute("""
@@ -358,7 +358,7 @@ class College0DB:
         """, (user_id,))
         self.conn.commit()
         return "Fine paid successfully."
-    
+
     def get_user_fines(self, user_id):
         cur = self.conn.cursor()
         cur.execute("""
@@ -367,7 +367,7 @@ class College0DB:
             WHERE user_id=?
             ORDER BY paid ASC, id DESC
         """, (user_id,))
-        return cur.fetchall()  
+        return cur.fetchall()
 
     def get_all_fines(self):
         cur = self.conn.cursor()
@@ -750,16 +750,17 @@ class College0DB:
         self.conn.execute("INSERT INTO complaints(filed_by, against_user, detail) VALUES (?, ?, ?)",
                           (filed_by, against_user, detail))
         self.conn.commit()
+
     def apply_for_graduation(self, student_id):
         cur = self.conn.cursor()
-        
+
         cur.execute("""
             SELECT COUNT(*) AS cnt
             FROM registrations
             WHERE student_id=? AND grade <> ''
         """, (student_id,))
         completed = cur.fetchone()["cnt"]
-        
+
         cur.execute("""
             SELECT c.code
             FROM courses c
@@ -773,9 +774,10 @@ class College0DB:
             )
         """, (student_id,))
         missing_required = [row["code"] for row in cur.fetchall()]
-        
+
         if completed < 8 or missing_required:
-            self.issue_warning(student_id, "reckless_graduation_application", 1)
+            self.issue_warning(
+                student_id, "reckless_graduation_application", 1)
             self.conn.execute("""
                 INSERT INTO graduation_applications(student_id, status, decision_note, created_at)
                 VALUES (?, 'Rejected', ?, ?)
@@ -786,14 +788,14 @@ class College0DB:
             ))
             self.conn.commit()
             return "Graduation rejected. You need 8 completed classes and all required courses. Warning issued."
-        
+
         self.conn.execute("""
             INSERT INTO graduation_applications(student_id, status, decision_note, created_at)
             VALUES (?, 'Pending', 'Eligible for registrar review.', ?)
         """, (student_id, datetime.now().isoformat()))
         self.conn.commit()
         return "Graduation application submitted for registrar review."
-    
+
     def get_graduation_applications(self):
         cur = self.conn.cursor()
         cur.execute("""
@@ -805,17 +807,17 @@ class College0DB:
         """)
         return cur.fetchall()
 
-
     def decide_graduation(self, grad_id, approve=True, note=""):
         cur = self.conn.cursor()
         status = "Approved" if approve else "Rejected"
         final_note = note.strip() or status
 
-        cur.execute("SELECT student_id FROM graduation_applications WHERE id=?", (grad_id,))
+        cur.execute(
+            "SELECT student_id FROM graduation_applications WHERE id=?", (grad_id,))
         row = cur.fetchone()
         if not row:
             return "Graduation application not found."
-        
+
         self.conn.execute("""
             UPDATE graduation_applications
             SET status=?, decision_note=?
@@ -935,7 +937,7 @@ class College0DB:
                 messages.append(f"{row['code']} has missing grades.")
         self.audit_instructor_class_performance()
         return " ".join(messages[:4])
-    
+
     def audit_instructor_class_performance(self):
         cur = self.conn.cursor()
 
@@ -957,9 +959,11 @@ class College0DB:
             """, (class_id,))
 
             grades = cur.fetchall()
-            points = {"A": 4.0, "A-": 3.7, "B+": 3.3, "B": 3.0, "B-": 2.7, "C+": 2.3, "C": 2.0, "D": 1.0, "F":0.0}
+            points = {"A": 4.0, "A-": 3.7, "B+": 3.3, "B": 3.0,
+                      "B-": 2.7, "C+": 2.3, "C": 2.0, "D": 1.0, "F": 0.0}
 
-            values = [points[g["grade"]] for g in grades if g["grade"] in points]
+            values = [points[g["grade"]]
+                      for g in grades if g["grade"] in points]
 
             if not values:
                 continue
@@ -967,11 +971,13 @@ class College0DB:
             class_gpa = sum(values) / len(values)
 
             if class_gpa > 3.5:
-                self.issue_warning(instructor_id, f"grade_inflation_{class_id}", 1)
+                self.issue_warning(
+                    instructor_id, f"grade_inflation_{class_id}", 1)
 
             elif class_gpa < 2.5:
-                self.issue_warning(instructor_id, f"low_class_performance_{class_id}", 2)
-                
+                self.issue_warning(
+                    instructor_id, f"low_class_performance_{class_id}", 2)
+
                 self.conn.execute(
                     "UPDATE users SET suspended=1 WHERE id=?",
                     (instructor_id,)
@@ -1303,7 +1309,7 @@ class College0App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("College0 - CCNY Style Demo")
+        self.root.title("EduNavigator - CCNY Style Demo")
         self.root.geometry("1300x820")
         self.root.minsize(1180, 760)
         self.root.configure(bg=self.BG)
@@ -1314,6 +1320,7 @@ class College0App:
         self.public_role_var = None
         self.public_name_entry = None
         self.public_gpa_entry = None
+        self.public_gpa_auto_value = None
         self.public_role_widget = None
         self.public_page_mode = "Dashboard"
         self.configure_styles()
@@ -1394,10 +1401,10 @@ class College0App:
         title_wrap.grid(row=0, column=1)
         tk.Label(
             title_wrap,
-            text="College0 Management System",
+            text="EduNavigator – CCNY Intelligent Academic Navigation System",
             bg=self.NAV,
             fg="white",
-            font=("Segoe UI", 22, "bold"),
+            font=("Segoe UI", 18, "bold"),
         ).pack()
         tk.Label(
             title_wrap,
@@ -1414,18 +1421,37 @@ class College0App:
         self.header_status = tk.Label(
             status_wrap, text="Guest mode", bg=self.NAV, fg="white", font=("Segoe UI", 10, "bold"))
         self.header_status.pack(anchor="e")
+        self.header_logout_btn = tk.Button(
+            status_wrap,
+            text="Logout",
+            command=self.logout_user,
+            relief="flat",
+            bg=self.GOLD,
+            fg=self.NAV,
+            activebackground="#d8b96d",
+            activeforeground=self.NAV,
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=4,
+            cursor="hand2",
+        )
 
         body = tk.Frame(self.root, bg=self.BG)
         body.pack(fill="both", expand=True)
 
-        self.sidebar = tk.Frame(body, bg=self.NAV, width=260)
+        self.sidebar = tk.Frame(body, bg=self.NAV, width=286)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
+
+        sidebar_scroll, _sidebar_canvas, sidebar_content = self.create_scrollable_frame(
+            self.sidebar, self.NAV, scrollbar_shell_bg=self.GOLD
+        )
+        sidebar_scroll.pack(fill="both", expand=True)
 
         self.content = tk.Frame(body, bg=self.BG)
         self.content.pack(side="left", fill="both", expand=True)
 
-        tk.Label(self.sidebar, text="MENU", bg=self.NAV, fg="#f1e9ff", font=(
+        tk.Label(sidebar_content, text="MENU", bg=self.NAV, fg="#f1e9ff", font=(
             "Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(22, 8))
 
         nav_items = [
@@ -1433,6 +1459,7 @@ class College0App:
             ("Apply as Student", lambda: self.open_public_application("Student")),
             ("Apply as Instructor", lambda: self.open_public_application("Instructor")),
             ("Login", lambda: self.show_page("Login", "Login")),
+            ("Logout", self.logout_user),
             ("Submit Review", self.open_review_page),
             ("File Complaint", self.open_complaint_page),
             ("AI Assistant", self.open_ai_page),
@@ -1441,7 +1468,7 @@ class College0App:
         ]
         for label, command in nav_items:
             btn = tk.Label(
-                self.sidebar,
+                sidebar_content,
                 text=label,
                 anchor="w",
                 bg=self.NAV,
@@ -1455,26 +1482,26 @@ class College0App:
             btn.pack(fill="x")
 
             btn.bind("<Button-1>", lambda e, cmd=command: cmd())
-            btn.bind("<Enter>", lambda e, b=btn: b.configure(bg=self.NAV_LIGHT))
+            btn.bind("<Enter>", lambda e,
+                     b=btn: b.configure(bg=self.NAV_LIGHT))
             btn.bind("<Leave>", lambda e, b=btn: b.configure(bg=self.NAV))
 
             tk.Frame(
-                self.sidebar,
+                sidebar_content,
                 bg="#8065ac",
                 height=1
             ).pack(fill="x", padx=14)
 
             self.nav_buttons[label] = btn
 
-
-        tk.Label(self.sidebar, text="Demo Access", bg=self.NAV, fg=self.GOLD, font=(
+        tk.Label(sidebar_content, text="Demo Access", bg=self.NAV, fg=self.GOLD, font=(
             "Segoe UI", 10, "bold")).pack(anchor="w", padx=20, pady=(18, 4))
         demo_text = "Registrar\nregistrar / admin123\n\nStudent\ns1001 / temp123\n\nInstructor\ni2001 / teach123"
-        tk.Label(self.sidebar, text=demo_text, justify="left", bg=self.NAV,
+        tk.Label(sidebar_content, text=demo_text, justify="left", bg=self.NAV,
                  fg="#efe8ff", font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(8, 0))
 
-        footer = tk.Frame(self.sidebar, bg=self.NAV)
-        footer.pack(side="bottom", fill="x", pady=20)
+        footer = tk.Frame(sidebar_content, bg=self.NAV)
+        footer.pack(fill="x", pady=20)
         tk.Label(
             footer,
             text="One-window local GUI\nSame project logic, updated branding",
@@ -1520,40 +1547,56 @@ class College0App:
             self.build_public_page()
             self.show_page("Public", "Dashboard")
 
+    def logout_user(self):
+        if not self.current_user:
+            messagebox.showinfo("Logout", "No user is currently logged in.")
+            return
+        self.current_user = None
+        self.refresh_header_status()
+        self.public_page_mode = "Dashboard"
+        self.build_public_page()
+        self.build_dashboard_placeholder()
+        self.show_page("Public", "Dashboard")
+        messagebox.showinfo("Logout", "You have been logged out successfully.")
+
     def open_public_application(self, role):
         self.public_page_mode = role
         self.build_public_page()
         self.show_page("Public", f"Apply as {role}")
         self.set_public_role(role)
-    
+
     def open_review_page(self):
         if not self.current_user or self.current_user["role"] != "Student":
-            messagebox.showerror("Access denied", "Please log in as a student first.")
+            messagebox.showerror(
+                "Access denied", "Please log in as a student first.")
             return
         self.build_review_page()
         self.show_page("Review", "Submit Review")
-    
+
     def open_complaint_page(self):
         if not self.current_user or self.current_user["role"] != "Student":
-            messagebox.showerror("Access denied", "Please log in as a student first.")
+            messagebox.showerror(
+                "Access denied", "Please log in as a student first.")
             return
         self.build_complaint_page()
         self.show_page("Complaint", "File Complaint")
+
     def build_complaint_page(self):
-        frame = self.pages["Complaint"]
-        self.clear_frame(frame)
+        frame = self.prepare_scrollable_page("Complaint")
 
         wrapper = tk.Frame(frame, bg=self.BG)
         wrapper.pack(fill="both", expand=True, padx=24, pady=24)
 
-        self.section_title(wrapper, "File Complaint", "Report an issue with another user")
+        self.section_title(wrapper, "File Complaint",
+                           "Report an issue with another user")
 
         card, body = self.make_card(wrapper, "Complaint Form")
         card.pack(fill="x", pady=20)
 
         tk.Label(body, text="Select User", bg=self.CARD).pack(anchor="w")
 
-        users = self.db.get_users_by_role("Instructor") + self.db.get_users_by_role("Student")
+        users = self.db.get_users_by_role(
+            "Instructor") + self.db.get_users_by_role("Student")
 
         user_map = {}
         user_var = tk.StringVar()
@@ -1593,26 +1636,25 @@ class College0App:
             messagebox.showinfo("Success", "Complaint submitted")
 
         tk.Button(body, text="Submit Complaint",
-                command=submit,
-                bg=self.NAV, fg="white").pack(pady=10)
-    
+                  command=submit,
+                  bg=self.NAV, fg="white").pack(pady=10)
+
     def open_ai_page(self):
         self.build_ai_page()
         self.show_page("AI", "AI Assistant")
 
     def build_review_page(self):
-        frame = self.pages["Review"]
-        self.clear_frame(frame)
+        frame = self.prepare_scrollable_page("Review")
 
         wrapper = tk.Frame(frame, bg=self.BG)
         wrapper.pack(fill="both", expand=True, padx=24, pady=24)
 
-        self.section_title(wrapper, "Submit Review", "Leave feedback for your classes")
+        self.section_title(wrapper, "Submit Review",
+                           "Leave feedback for your classes")
 
         card, body = self.make_card(wrapper, "Review Form")
         card.pack(fill="x", pady=20)
 
-    
         classes = self.db.get_student_registrations(self.current_user["id"])
 
         class_map = {}
@@ -1631,7 +1673,6 @@ class College0App:
 
         dropdown["values"] = values
 
-    
         tk.Label(body, text="Stars (1-5)", bg=self.CARD).pack(anchor="w")
         stars_entry = tk.Entry(body)
         stars_entry.pack(fill="x", pady=5)
@@ -1640,8 +1681,6 @@ class College0App:
         tk.Label(body, text="Review", bg=self.CARD).pack(anchor="w")
         review_box = tk.Text(body, height=4)
         review_box.pack(fill="x", pady=5)
-
-    
 
         def submit():
             selected = class_var.get()
@@ -1674,28 +1713,27 @@ class College0App:
             messagebox.showinfo("Result", result)
 
         tk.Button(body, text="Submit Review",
-                command=submit,
-                bg=self.NAV, fg="white").pack(pady=10)
+                  command=submit,
+                  bg=self.NAV, fg="white").pack(pady=10)
 
     def build_ai_page(self):
-        frame = self.pages["AI"]
-        self.clear_frame(frame)
-        
+        frame = self.prepare_scrollable_page("AI")
+
         wrapper = tk.Frame(frame, bg=self.BG)
         wrapper.pack(fill="both", expand=True, padx=24, pady=24)
         ai_title = self.get_ai_panel_title(self.current_user)
-        
+
         self.section_title(
             wrapper,
             ai_title,
             "Ask questions about registrations, GPA, classes, reviews, warnings, and semester rules."
-            )
+        )
         ai_card = self.build_ai_panel(
             wrapper,
             self.current_user,
             ai_title
-            )
-        
+        )
+
         ai_card.pack(fill="both", expand=True, pady=(20, 0))
 
     def show_help(self):
@@ -1704,19 +1742,138 @@ class College0App:
             "Use the left menu to view the home page, submit an application, or log in with one of the demo accounts.",
         )
 
-    def set_public_role(self, role):
+    def set_public_role(self, role, preserve_manual_value=False):
         if self.public_role_var is not None:
             self.public_role_var.set(role)
         if self.public_gpa_entry is not None:
-            self.public_gpa_entry.delete(0, tk.END)
-            self.public_gpa_entry.insert(
-                0, "3.20" if role == "Student" else "0.00")
+            default_value = "3.20" if role == "Student" else "0.00"
+            current_value = self.public_gpa_entry.get().strip()
+            should_replace = not preserve_manual_value or current_value in {
+                "",
+                "0.00",
+                "3.20",
+                self.public_gpa_auto_value,
+            }
+            self.public_gpa_entry.configure(state="normal")
+            if should_replace:
+                self.public_gpa_entry.delete(0, tk.END)
+                self.public_gpa_entry.insert(0, default_value)
+                self.public_gpa_auto_value = default_value
+            if role == "Instructor":
+                self.public_gpa_entry.configure(
+                    state="readonly",
+                    readonlybackground=self.CARD,
+                    fg=self.TEXT,
+                )
+            else:
+                self.public_gpa_entry.configure(state="normal")
         if self.public_name_entry is not None:
             self.public_name_entry.focus_set()
 
     def clear_frame(self, frame):
         for widget in frame.winfo_children():
             widget.destroy()
+
+    def ensure_mousewheel_support(self):
+        if getattr(self, "_mousewheel_bound", False):
+            return
+        self.root.bind_all("<MouseWheel>", self.handle_mousewheel, add="+")
+        self.root.bind_all(
+            "<Button-4>", self.handle_mousewheel_linux_up, add="+")
+        self.root.bind_all(
+            "<Button-5>", self.handle_mousewheel_linux_down, add="+")
+        self._mousewheel_bound = True
+
+    def find_scroll_target(self, widget):
+        current = widget
+        while current is not None:
+            target = getattr(current, "_college0_scroll_target", None)
+            if target is not None:
+                return target
+            current = current.master
+        return None
+
+    def handle_mousewheel(self, event):
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        target = self.find_scroll_target(widget)
+        if target is None:
+            return
+        step = int(-event.delta / 120)
+        if step:
+            target.yview_scroll(step, "units")
+
+    def handle_mousewheel_linux_up(self, event):
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        target = self.find_scroll_target(widget)
+        if target is not None:
+            target.yview_scroll(-1, "units")
+
+    def handle_mousewheel_linux_down(self, event):
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        target = self.find_scroll_target(widget)
+        if target is not None:
+            target.yview_scroll(1, "units")
+
+    def create_scrollable_frame(self, parent, bg, scrollbar_shell_bg=None):
+        self.ensure_mousewheel_support()
+        container = tk.Frame(parent, bg=bg)
+        canvas = tk.Canvas(
+            container,
+            bg=bg,
+            highlightthickness=0,
+            bd=0,
+            relief="flat",
+        )
+        scrollbar_shell = tk.Frame(
+            container,
+            bg=scrollbar_shell_bg or self.BORDER,
+            width=30,
+            highlightthickness=1,
+            highlightbackground=self.NAV_DARK,
+        )
+        scrollbar = tk.Scrollbar(
+            scrollbar_shell,
+            orient="vertical",
+            command=canvas.yview,
+            width=22,
+            troughcolor=self.NAV_DARK,
+            bg=self.GOLD,
+            activebackground="#d8b96d",
+            relief="raised",
+            bd=2,
+            highlightbackground=self.NAV_DARK,
+            highlightcolor=self.NAV_DARK,
+            elementborderwidth=2,
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar_shell.pack(side="right", fill="y")
+        scrollbar_shell.pack_propagate(False)
+        scrollbar.pack(fill="y", expand=True, padx=3, pady=3)
+
+        inner = tk.Frame(canvas, bg=bg)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        for widget in (container, canvas, inner, scrollbar_shell, scrollbar):
+            widget._college0_scroll_target = canvas
+
+        inner.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(window_id, width=event.width),
+        )
+        return container, canvas, inner
+
+    def prepare_scrollable_page(self, page_name, bg=None):
+        page = self.pages[page_name]
+        self.clear_frame(page)
+        container, _canvas, inner = self.create_scrollable_frame(
+            page, bg or self.BG)
+        container.pack(fill="both", expand=True)
+        return inner
 
     def make_card(self, parent, title, subtitle=None):
         outer = tk.Frame(parent, bg=self.BORDER)
@@ -1800,7 +1957,8 @@ class College0App:
             return self.get_ai_suggestions(user)
 
         prompts = []
-        tokens = set(self.db.normalize_ai_tokens(f"{question_text} {answer_text}"))
+        tokens = set(self.db.normalize_ai_tokens(
+            f"{question_text} {answer_text}"))
 
         if "graduation" in tokens:
             prompts.extend([
@@ -1850,7 +2008,7 @@ class College0App:
                 deduped.append(prompt)
         return deduped[:3]
 
-    def build_ai_panel(self, parent, user=None, title="College0 AI Assistant"):
+    def build_ai_panel(self, parent, user=None, title="EduNavigator AI Assistant"):
         card, body = self.make_card(
             parent,
             title,
@@ -1887,7 +2045,7 @@ class College0App:
 
         source_label = tk.Label(
             body,
-            text="Current answer source: local College0 knowledge store is ready.",
+            text="Current answer source: local EduNavigator knowledge store is ready.",
             bg=self.CARD,
             fg=self.MUTED,
             font=("Segoe UI", 9),
@@ -1926,7 +2084,8 @@ class College0App:
         answer = tk.Text(body, height=8, relief="solid", bd=1,
                          font=("Segoe UI", 10), wrap="word")
         answer.pack(fill="both", expand=True)
-        answer.insert("1.0", "Answers will appear here. The AI checks local college knowledge first.")
+        answer.insert(
+            "1.0", "Answers will appear here. The AI checks local college knowledge first.")
         answer.config(state="disabled")
 
         followup_wrap = tk.Frame(body, bg=self.CARD)
@@ -1993,7 +2152,8 @@ class College0App:
 
         def ask_ai():
             question_text = question.get("1.0", tk.END).strip()
-            status_label.config(text="Searching the local college knowledge store...")
+            status_label.config(
+                text="Searching the local college knowledge store...")
             response = self.db.answer_question(question_text, user)
             set_answer(response["answer"])
             if response["used_external"]:
@@ -2002,14 +2162,16 @@ class College0App:
                     text="Current answer source: external fallback placeholder. Keep the hallucination warning in mind.",
                     fg=self.WARNING_TEXT,
                 )
-                status_label.config(text="No strong local match found. External fallback would be used here.")
+                status_label.config(
+                    text="No strong local match found. External fallback would be used here.")
             else:
                 warning_box.pack_forget()
                 source_label.config(
-                    text="Current answer source: local College0 knowledge store.",
+                    text="Current answer source: local EduNavigator knowledge store.",
                     fg=self.MUTED,
                 )
-                status_label.config(text="Local answer found from the college knowledge store.")
+                status_label.config(
+                    text="Local answer found from the college knowledge store.")
             render_followups(
                 self.get_ai_followups(
                     user,
@@ -2021,13 +2183,15 @@ class College0App:
 
         def clear_ai():
             question.delete("1.0", tk.END)
-            set_answer("Answers will appear here. The AI checks local college knowledge first.")
+            set_answer(
+                "Answers will appear here. The AI checks local college knowledge first.")
             warning_box.pack_forget()
             source_label.config(
-                text="Current answer source: local College0 knowledge store is ready.",
+                text="Current answer source: local EduNavigator knowledge store is ready.",
                 fg=self.MUTED,
             )
-            status_label.config(text="Ready for a question. Press Ctrl+Enter to ask.")
+            status_label.config(
+                text="Ready for a question. Press Ctrl+Enter to ask.")
             render_followups(self.get_ai_suggestions(user))
 
         question.bind("<Control-Return>", lambda event: (ask_ai(), "break")[1])
@@ -2125,15 +2289,14 @@ class College0App:
     ####
 
     def build_public_page(self):
-        frame = self.pages["Public"]
-        self.clear_frame(frame)
+        frame = self.prepare_scrollable_page("Public")
 
         hero = tk.Frame(frame, bg=self.BG)
         hero.pack(fill="x", padx=30, pady=(28, 16))
 
         tk.Label(
             hero,
-            text="Welcome to College0",
+            text="Welcome to EduNavigator",
             bg=self.BG,
             fg=self.NAV_DARK,
             font=("Segoe UI", 30, "bold"),
@@ -2286,6 +2449,12 @@ class College0App:
                 state="readonly",
                 font=("Segoe UI", 10),
             )
+            self.public_role_widget.bind(
+                "<<ComboboxSelected>>",
+                lambda _event: self.set_public_role(
+                    self.public_role_var.get(), preserve_manual_value=True
+                ),
+            )
         else:
             self.public_role_var = tk.StringVar(value=self.public_page_mode)
 
@@ -2304,7 +2473,6 @@ class College0App:
         self.public_role_widget.grid(
             row=1, column=1, padx=6, pady=(0, 10), sticky="we"
         )
- 
 
         tk.Label(
             form,
@@ -2324,7 +2492,7 @@ class College0App:
 
         tk.Label(
             form,
-            text="Student applications use GPA. Instructor applications can leave GPA at 0.00.",
+            text="Student applications use GPA. Instructor applications keep GPA fixed at 0.00.",
             bg=self.CARD,
             fg=self.MUTED,
             font=("Segoe UI", 9),
@@ -2376,10 +2544,8 @@ class College0App:
         ai_card = self.build_ai_panel(frame, None, "Visitor AI Assistant")
         ai_card.pack(fill="both", expand=True, padx=24, pady=(0, 18))
 
-       
     def build_login_page(self):
-        frame = self.pages["Login"]
-        self.clear_frame(frame)
+        frame = self.prepare_scrollable_page("Login")
         wrap = tk.Frame(frame, bg=self.BG)
         wrap.pack(fill="both", expand=True, padx=40, pady=36)
         left = tk.Frame(wrap, bg=self.BG)
@@ -2435,8 +2601,7 @@ class College0App:
         pass_entry.bind("<Return>", lambda e: login())
 
     def build_dashboard_placeholder(self):
-        frame = self.pages["Dashboard"]
-        self.clear_frame(frame)
+        frame = self.prepare_scrollable_page("Dashboard")
         wrap = tk.Frame(frame, bg=self.BG)
         wrap.pack(fill="both", expand=True, padx=30, pady=30)
         self.section_title(wrap, "Dashboard",
@@ -2449,8 +2614,12 @@ class College0App:
     def refresh_header_status(self):
         if self.current_user:
             text = f"{self.current_user['full_name']} | {self.current_user['role']} | {self.db.get_current_period()}"
+            if not self.header_logout_btn.winfo_ismapped():
+                self.header_logout_btn.pack(anchor="e", pady=(8, 0))
         else:
             text = f"Guest mode | {self.db.get_current_period()}"
+            if self.header_logout_btn.winfo_ismapped():
+                self.header_logout_btn.pack_forget()
         self.header_status.config(text=text)
 
     def prompt_password_change(self, user_id):
@@ -2483,8 +2652,7 @@ class College0App:
                   padx=16, pady=8, cursor="hand2").pack(anchor="w")
 
     def build_dashboard(self):
-        frame = self.pages["Dashboard"]
-        self.clear_frame(frame)
+        frame = self.prepare_scrollable_page("Dashboard")
         user = self.current_user
         self.refresh_header_status()
         summary = self.db.get_user_summary(user["id"])
@@ -2758,25 +2926,26 @@ class College0App:
         tk.Button(setup_form, text="Save Class Setup", command=save_setup, relief="flat", bg=self.GOLD, fg=self.NAV,
                   activebackground="#c79310", activeforeground=self.NAV, font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(4, 0))
-        
+
         grad_card, grad_body = self.make_card(
             frame,
             "Graduation Applications",
             "Review student graduation requests."
         )
         grad_card.pack(fill="x", padx=24, pady=(12, 0))
-        
+
         grad_apps = self.db.get_graduation_applications()
         grad_list = self.styled_listbox(grad_body, height=6)
         grad_list.pack(fill="x")
-        
+
         for g in grad_apps:
             grad_list.insert(
                 tk.END,
                 f"#{g['id']} | {g['full_name']} ({g['username']}) | {g['status']} | {g['decision_note']}"
             )
-            
-        note_box = tk.Text(grad_body, height=3, relief="solid", bd=1, font=("Segoe UI", 10))
+
+        note_box = tk.Text(grad_body, height=3, relief="solid",
+                           bd=1, font=("Segoe UI", 10))
         note_box.pack(fill="x", pady=(10, 0))
 
         def approve_grad():
@@ -2790,7 +2959,7 @@ class College0App:
             )
             messagebox.showinfo("Graduation", msg)
             self.build_dashboard()
-            
+
         def reject_grad():
             sel = grad_list.curselection()
             if not sel:
@@ -2811,8 +2980,6 @@ class College0App:
 
         tk.Button(btns, text="Reject Graduation", command=reject_grad, bg=self.DANGER, fg="white",
                   relief="flat", padx=14, pady=8, font=("Segoe UI", 10, "bold")).pack(side="left")
-        
-
 
         fine_card, fine_body = self.make_card(
             frame,
@@ -2864,7 +3031,7 @@ class College0App:
         for c in classes:
             class_list.insert(
                 tk.END, f"#{c['id']}  |  {c['code']} {c['title']}  |  {c['meeting_time']}  |  {c['enrolled']}/{c['capacity']}  |  {c['period_state']}")
-            
+
         def apply_grad():
             msg = self.db.apply_for_graduation(self.current_user["id"])
             messagebox.showinfo("Graduation", msg)
@@ -2922,7 +3089,7 @@ class College0App:
                 )
         else:
             fine_list.insert(tk.END, "No fines found.")
-        
+
         def pay_my_fines():
             msg = self.db.pay_fine(self.current_user["id"])
             messagebox.showinfo("Fine Payment", msg)
@@ -2941,8 +3108,8 @@ class College0App:
             cursor="hand2"
         ).pack(anchor="w", pady=(10, 0))
 
-
-        if self.current_user.get("gpa", 0) >= 3.7:
+        student_summary = self.db.get_user_summary(self.current_user["id"])
+        if (student_summary["overall_gpa"] or 0) >= 3.7:
             dean_label = tk.Label(
                 row,
                 text="🏆 Dean's List Student",
@@ -3096,9 +3263,7 @@ class College0App:
         tk.Button(complaint_body, text="Submit Complaint", command=file_instructor_complaint, relief="flat", bg=self.NAV, fg="white",
                   activebackground=self.NAV_LIGHT, activeforeground="white", font=("Segoe UI", 10, "bold"),
                   padx=16, pady=8, cursor="hand2").pack(anchor="w", pady=(12, 0))
-    
-    
-    
+
 
 if __name__ == "__main__":
     root = tk.Tk()
