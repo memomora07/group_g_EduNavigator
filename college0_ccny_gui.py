@@ -203,6 +203,7 @@ class College0DB:
 
     def seed_data(self):
         cur = self.conn.cursor()
+        default_semester = "Spring 2026"
 
         def ensure_user(username, password, role, full_name, must_change=0):
             cur.execute("SELECT id FROM users WHERE username = ?", (username,))
@@ -214,6 +215,24 @@ class College0DB:
                 VALUES (?, ?, ?, ?, ?)
             """, (username, password, role, full_name, must_change))
             return cur.lastrowid
+
+        def ensure_class(course_code, instructor_id, meeting_time, capacity):
+            cur.execute("SELECT id FROM courses WHERE code=?", (course_code,))
+            course_row = cur.fetchone()
+            if not course_row:
+                return
+            course_id = course_row["id"]
+            cur.execute("""
+                SELECT id
+                FROM classes
+                WHERE course_id=? AND semester=? AND meeting_time=?
+            """, (course_id, default_semester, meeting_time))
+            if cur.fetchone():
+                return
+            cur.execute("""
+                INSERT INTO classes(course_id, instructor_id, semester, period_state, meeting_time, capacity)
+                VALUES (?, ?, ?, 'Registration', ?, ?)
+            """, (course_id, instructor_id, default_semester, meeting_time, capacity))
 
         ensure_user("registrar", "admin123", "Registrar", "Main Registrar")
         student1 = ensure_user(
@@ -241,29 +260,41 @@ class College0DB:
             ("CS102", "Data Structures", 1),
             ("CS201", "Software Engineering", 0),
             ("CS205", "Database Systems", 0),
+            ("CS210", "Computer Architecture", 0),
+            ("CS220", "Web Development", 0),
+            ("CS230", "Cybersecurity Basics", 0),
+            ("CS240", "Mobile App Design", 0),
+            ("CS250", "Machine Learning Foundations", 0),
             ("MATH101", "Discrete Math", 1),
+            ("MATH201", "Linear Algebra", 0),
+            ("STAT201", "Applied Statistics", 0),
             ("ENG101", "Academic Writing", 1),
+            ("HIST110", "World History", 0),
+            ("ART105", "Art Appreciation", 0),
         ]
         for code, title, req in courses:
             cur.execute(
                 "INSERT OR IGNORE INTO courses(code, title, required) VALUES (?, ?, ?)", (code, title, req))
 
-        cur.execute("SELECT COUNT(*) AS cnt FROM classes")
-        if cur.fetchone()["cnt"] == 0:
-            class_specs = [
-                ("CS101", instructor1, "Mon 10:00-12:00", 3),
-                ("CS201", instructor2, "Wed 14:00-16:00", 2),
-                ("CS205", instructor3, "Tue 09:00-11:00", 2),
-                ("MATH101", instructor2, "Thu 12:00-14:00", 3),
-            ]
-            for course_code, inst, meeting, cap in class_specs:
-                cur.execute("SELECT id FROM courses WHERE code=?",
-                            (course_code,))
-                course_id = cur.fetchone()["id"]
-                cur.execute("""
-                    INSERT INTO classes(course_id, instructor_id, semester, period_state, meeting_time, capacity)
-                    VALUES (?, ?, 'Spring 2026', 'Registration', ?, ?)
-                """, (course_id, inst, meeting, cap))
+        class_specs = [
+            ("CS101", instructor1, "Mon 10:00-12:00", 3),
+            ("CS102", instructor1, "Fri 10:00-12:00", 3),
+            ("CS201", instructor2, "Wed 14:00-16:00", 2),
+            ("CS205", instructor3, "Tue 09:00-11:00", 2),
+            ("CS210", instructor2, "Tue 13:00-15:00", 3),
+            ("CS220", instructor1, "Thu 09:00-11:00", 3),
+            ("CS230", instructor3, "Fri 13:00-15:00", 3),
+            ("CS240", instructor1, "Wed 09:00-11:00", 2),
+            ("CS250", instructor3, "Mon 14:00-16:00", 2),
+            ("MATH101", instructor2, "Thu 12:00-14:00", 3),
+            ("MATH201", instructor2, "Tue 15:30-17:30", 3),
+            ("STAT201", instructor2, "Wed 16:00-18:00", 3),
+            ("ENG101", instructor1, "Mon 08:00-10:00", 3),
+            ("HIST110", instructor3, "Thu 15:00-17:00", 3),
+            ("ART105", instructor3, "Fri 09:00-11:00", 3),
+        ]
+        for course_code, inst, meeting, cap in class_specs:
+            ensure_class(course_code, inst, meeting, cap)
 
         for word in ["stupid", "idiot", "trash"]:
             cur.execute(
